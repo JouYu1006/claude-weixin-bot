@@ -538,84 +538,87 @@ function trimConversation(convo) {
 /** Heuristic: does this message likely need a web search? */
 function shouldSearch(text) {
     const t = text.trim();
-    // Explicit commands
-    const explicit = t.match(/^(?:搜索|搜一下|查一下|帮我搜|帮我查|网上查|联网搜|查查)[：:]*\s*(.+)/);
+    // Explicit: "搜索 xxx", "搜 xxx", "/s xxx"
+    const explicit = t.match(/^(?:搜索|搜一下|查一下|帮我搜|帮我查|网上查|联网搜|查查|\/s|\/search)[：:\s]+(.+)/i);
     if (explicit)
         return explicit[1].trim();
-    // Time-sensitive / factual keywords
+    // Short "?" prefix: "?xxx" triggers search
+    if (t.startsWith("?"))
+        return t.slice(1).trim();
+    // Auto-detect: time-sensitive / factual keywords
     const triggers = [
         "今天", "现在", "最近", "最新", "刚刚", "当前", "实时",
-        "新闻", "天气", "股价", "汇率", "热搜", "发生了", "发生什么",
-        "什么时候", "多少钱", "价格",
-        "realtime", "today", "news", "latest",
+        "新闻", "天气", "股价", "汇率", "热搜", "发生什么",
+        "realtime", "today news", "latest",
     ];
-    if (triggers.some(kw => t.includes(kw))) {
+    if (triggers.some(kw => t.toLowerCase().includes(kw.toLowerCase())))
         return t;
-    }
     return null;
 }
+/**
+ * Reliable search that works from Railway (US servers).
+ * Uses DuckDuckGo HTML endpoint with stable structure.
+ */
 async function performSearch(query) {
-    const slog = (msg) => console.log(`[search] ${msg}`);
-    const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
-    // Try 1: DuckDuckGo Instant Answer (works from US)
+    const slog = (msg) => log(`[search] ${msg}`);
+    const ua = "Mozilla/5.0 (compatible; ClaudeWeixinBot/1.0)";
+    // Engine 1: DuckDuckGo HTML (most reliable, stable structure)
     try {
-        const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1&t=claude-weixin-bot`;
-        const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
-        const data = await resp.json();
-        const results = [];
-        const abstract = data.AbstractText?.trim();
-        if (abstract) {
-            results.push({ title: data.Heading || query, snippet: abstract, url: data.AbstractURL || "" });
-        }
-        const topics = data.RelatedTopics;
-        if (topics) {
-            for (const t of topics) {
-                if (t.Text && results.length < 6)
-                    results.push({ title: "", snippet: t.Text, url: t.FirstURL || "" });
-            }
-        }
-        if (results.length > 0) {
-            slog(`DDG API: ${results.length} results`);
-            return results;
-        }
-    }
-    catch (err) {
-        slog(`DDG API err: ${String(err)}`);
-    }
-    // Try 2: DuckDuckGo Lite HTML
-    try {
-        const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
-        const resp = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { "User-Agent": ua } });
+        const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+        slog(`trying DDG HTML...`);
+        const resp = await fetch(url, {
+            signal: AbortSignal.timeout(12000),
+            headers: { "User-Agent": ua, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" },
+        });
         const html = await resp.text();
+        slog(`DDG HTML response: ${html.length} bytes`);
         const results = [];
-        const re = /<a[^>]*href="([^"]+)"[^>]*class="result-link"[^>]*>([^<]+)<\/a>/gi;
-        let m;
-        while ((m = re.exec(html)) !== null && results.length < 6)
-            results.push({ title: m[2].trim(), snippet: "", url: m[1] });
-        if (results.length > 0) {
-            slog(`DDG Lite: ${results.length} results`);
-            return results;
-        }
-    }
-    catch (err) {
-        slog(`DDG Lite err: ${String(err)}`);
-    }
-    // Try 3: Bing
-    try {
-        const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=zh-cn&count=10`;
-        const resp = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { "User-Agent": ua, "Accept-Language": "zh-CN" } });
-        const html = await resp.text();
-        const results = [];
-        const blockRe = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/gi;
+        // DDG HTML results: <a rel="nofollow" class="result__a" href="...">title</a>
+        // followed by <a class="result__snippet">snippet</a>
+        const blockRe = /class="result__body"[^>]*>([\s\S]*?)<\/td>/gi;
         let b;
         while ((b = blockRe.exec(html)) !== null && results.length < 6) {
             const body = b[1];
-            const tm = /<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
-            const sm = /<(?:p|div)[^>]*>([\s\S]{20,400}?)<\/(?:p|div)>/i.exec(body);
+            const tm = /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
+            const sm = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
             if (tm) {
                 const title = tm[2].replace(/<[^>]+>/g, "").trim();
-                if (title && title.length > 2)
-                    results.push({ title, snippet: sm?.[1]?.replace(/<[^>]+>/g, "").trim() || "", url: tm[1] });
+                const url = tm[1].startsWith("//") ? `https:${tm[1]}` : tm[1];
+                if (title)
+                    results.push({ title, snippet: sm?.[1]?.replace(/<[^>]+>/g, "").trim() || "", url });
+            }
+        }
+        if (results.length > 0) {
+            slog(`DDG HTML: ${results.length} results`);
+            return results;
+        }
+    }
+    catch (err) {
+        slog(`DDG HTML err: ${String(err)}`);
+    }
+    // Engine 2: Bing (works from US)
+    try {
+        const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10`;
+        slog(`trying Bing...`);
+        const resp = await fetch(url, {
+            signal: AbortSignal.timeout(10000),
+            headers: { "User-Agent": ua, "Accept-Language": "zh-CN" },
+        });
+        const html = await resp.text();
+        slog(`Bing response: ${html.length} bytes, status: ${resp.status}`);
+        const results = [];
+        const re = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/gi;
+        let b;
+        while ((b = re.exec(html)) !== null && results.length < 6) {
+            const body = b[1];
+            const tm = /<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
+            const sm = /<(?:p|div)[^>]*>([\s\S]{15,300}?)<\/(?:p|div)>/i.exec(body);
+            if (tm) {
+                const title = tm[2].replace(/<[^>]+>/g, "").trim();
+                const url = tm[1].startsWith("http") ? tm[1] : `https://www.bing.com${tm[1]}`;
+                if (title && title.length > 2) {
+                    results.push({ title, snippet: sm?.[1]?.replace(/<[^>]+>/g, "").trim() || "", url });
+                }
             }
         }
         if (results.length > 0) {
@@ -626,22 +629,7 @@ async function performSearch(query) {
     catch (err) {
         slog(`Bing err: ${String(err)}`);
     }
-    // Try 4: SearXNG public instance
-    try {
-        const url = `https://search.sapti.me/search?q=${encodeURIComponent(query)}&format=json&lang=zh-CN`;
-        const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
-        const data = await resp.json();
-        const raw = data.results || [];
-        const results = raw.slice(0, 6).map(r => ({ title: r.title || "", snippet: r.content || "", url: r.url || "" }));
-        if (results.length > 0) {
-            slog(`SearXNG: ${results.length} results`);
-            return results;
-        }
-    }
-    catch (err) {
-        slog(`SearXNG err: ${String(err)}`);
-    }
-    slog(`ALL search engines failed for "${query}"`);
+    slog(`ALL engines failed for "${query}"`);
     return [];
 }
 function formatSearchResults(query, results) {
@@ -723,7 +711,12 @@ async function callLLM(userId, userMessage, account) {
         convo.push({ role: "user", content: userMessage });
         convo.push({ role: "assistant", content: replyText });
         trimConversation(convo);
-        return splitText(replyText);
+        // Prepend search indicator if search was triggered
+        const result = splitText(replyText);
+        if (searchHint && result.length > 0) {
+            result[0] = searchHint + " " + result[0];
+        }
+        return result;
     }
     catch (err) {
         if (config.typing_ticket) {
