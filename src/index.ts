@@ -771,7 +771,45 @@ async function performSearch(query: string): Promise<SearchResult[]> {
   let anyEngineReachable = false;
   let status = "";
 
-  // Engine 1: DDG HTML — richest results (works from US)
+  const isNewsItem = /news|新闻|动态|进展|大事|\d{4}-\d{2}-\d{2}/.test(query);
+
+  // Engine 1 (news): Google News RSS — free, real articles with titles+snippets
+  if (isNewsItem) {
+    try {
+      const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`;
+      slog(`Google News RSS...`);
+      const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      const xml = await resp.text();
+      anyEngineReachable = true;
+
+      const results: SearchResult[] = [];
+      const itemRe = /<item>([\s\S]*?)<\/item>/gi;
+      let m; while ((m = itemRe.exec(xml)) !== null && results.length < 8) {
+        const item = m[1];
+        // CDATA or plain text for title/desc/link
+        const tm = /<title>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))\s*<\/title>/i.exec(item);
+        const sm = /<description>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))\s*<\/description>/i.exec(item);
+        const lm = /<link>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))\s*<\/link>/i.exec(item);
+        // Google News: <source url="...">Name</source>
+        const srcUrlM = /<source\b[^>]*url="([^"]*)"/i.exec(item);
+        const srcNameM = /<source\b[^>]*>([^<]*)<\/source>/i.exec(item);
+        const title = (tm?.[1] || tm?.[2] || "").replace(/<[^>]+>/g, "").trim();
+        let snippet = (sm?.[1] || sm?.[2] || "").replace(/<[^>]+>/g, "").trim();
+        const link = (lm?.[1] || lm?.[2] || "").trim();
+        const source = srcNameM?.[1]?.trim() || "";
+
+        if (title && title.length > 5 && !/video|watch|live/i.test(title)) {
+          if (source) snippet = `[来源: ${source}] ${snippet}`;
+          results.push({ title, snippet, url: link.trim() });
+        }
+      }
+      slog(`Google News: ${resp.status}, ${results.length} articles`);
+      status = "Google News OK";
+      if (results.length > 0) { searchEngineStatus = status; lastSearchError = ""; return results; }
+    } catch (err) { slog(`Google News err: ${String(err)}`); }
+  }
+
+  // Engine 2: DDG HTML
   try {
     const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
     slog(`DDG HTML...`);
@@ -1001,14 +1039,13 @@ async function callLLM(
     log(`🔍 搜索结果: ${results.length} 条`);
     if (results.length > 0) {
       searchContext = `（${new Date().toLocaleDateString("zh-CN")}）：\n${formatSearchResults(searchQuery, results)}`;
+      searchHint = "📡 ";
 
-      // Fetch full content from top 3 pages
-      const fullPages = await fetchTopPages(results, 3);
-      if (fullPages) {
-        searchContext += `\n\n--- 详细内容 ---\n${fullPages}`;
-        searchHint = "📡 ";
-      } else {
-        searchHint = "📡 ";
+      // Fetch full pages only if snippets are thin (not from Google News RSS)
+      const hasRichSnippets = results.some(r => r.snippet && r.snippet.length > 100);
+      if (!hasRichSnippets) {
+        const fullPages = await fetchTopPages(results, 2);
+        if (fullPages) searchContext += `\n\n--- 详细内容 ---\n${fullPages}`;
       }
     } else {
       searchHint = "";
