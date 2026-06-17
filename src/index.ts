@@ -833,6 +833,73 @@ function formatSearchResults(query: string, results: SearchResult[]): string {
 }
 
 // ---------------------------------------------------------------------------
+// Full-text page fetching (for deep summarization)
+// ---------------------------------------------------------------------------
+
+/** Extract visible text from HTML, removing scripts/styles/tags */
+function htmlToText(html: string): string {
+  let text = html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, "")
+    .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, "")
+    .replace(/<[^>]+>/g, "\n")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#x27;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]+/g, " ")
+    .split("\n")
+    .map(l => l.trim())
+    .filter(l => l.length > 20) // skip navigation/empty lines
+    .join("\n");
+
+  // Truncate to reasonable size
+  if (text.length > 4000) text = text.slice(0, 4000) + "...";
+  return text;
+}
+
+async function fetchPageText(url: string): Promise<string> {
+  try {
+    const resp = await fetch(url, {
+      signal: AbortSignal.timeout(8000),
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; ClaudeWeixinBot/1.0)", "Accept": "text/html", "Accept-Language": "zh-CN,en" },
+    });
+    const html = await resp.text();
+    return htmlToText(html);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Fetch full text of top N search results for deep summarization.
+ * Returns concatenated page contents with source attribution.
+ */
+async function fetchTopPages(results: SearchResult[], maxPages: number = 3): Promise<string> {
+  const urls = results.filter(r => r.url && !r.url.includes("duckduckgo.com")).slice(0, maxPages);
+  if (urls.length === 0) return "";
+
+  log(`📄 抓取 ${urls.length} 个页面全文...`);
+
+  const pages: string[] = [];
+  for (const r of urls) {
+    const text = await fetchPageText(r.url);
+    if (text) {
+      pages.push(`--- 来源: ${r.title || r.url} ---\n${r.url}\n\n${text}`);
+      log(`   ✅ ${r.title?.slice(0, 40) || r.url.slice(0, 40)} (${text.length} 字)`);
+    } else {
+      log(`   ⚠️  ${r.title?.slice(0, 40) || r.url.slice(0, 40)} 抓取失败`);
+    }
+  }
+
+  return pages.length > 0 ? pages.join("\n\n") : "";
+}
+
+// ---------------------------------------------------------------------------
 // LLM call — search-before-answer strategy
 // ---------------------------------------------------------------------------
 
@@ -875,8 +942,16 @@ async function callLLM(
     const results = await performSearch(optimized);
     log(`🔍 搜索结果: ${results.length} 条`);
     if (results.length > 0) {
-      searchContext = `互联网信息（${new Date().toLocaleDateString("zh-CN")}）：\n${formatSearchResults(searchQuery, results)}`;
-      searchHint = "【已联网搜索】 ";
+      searchContext = `搜索摘要（${new Date().toLocaleDateString("zh-CN")}）：\n${formatSearchResults(searchQuery, results)}`;
+
+      // Fetch full content from top 3 pages
+      const fullPages = await fetchTopPages(results, 3);
+      if (fullPages) {
+        searchContext += `\n\n--- 以下为页面全文 ---\n${fullPages}`;
+        searchHint = "【已联网搜索+全文】 ";
+      } else {
+        searchHint = "【已联网搜索】 ";
+      }
     } else {
       searchHint = "【搜索无结果】 ";
       log(`⚠️ 所有搜索引擎均失败`);
@@ -891,7 +966,8 @@ async function callLLM(
   let promptUserMessage = userMessage;
 
   if (searchContext) {
-    promptUserMessage = `以下是你收到的参考资料，请根据这些资料回答用户的问题。
+    const hasFullPages = searchContext.includes("页面全文");
+    promptUserMessage = `你拥有了来自互联网的资料。请基于这些资料回答用户的问题。
 
 【用户的问题】
 ${userMessage}
@@ -899,10 +975,11 @@ ${userMessage}
 【参考资料】
 ${searchContext}
 
-【重要指引】
-- 如果资料包含具体信息，直接引用并回答
-- 如果资料只有网站链接没有内容，告诉用户可以去哪些网站查看，并列出网站名称
-- 绝对不要说你不能搜索——资料已经给你了`;
+【核心任务】
+${hasFullPages ?
+  "以上资料包含完整页面内容。请仔细阅读页面全文，提取与用户问题相关的关键信息，用你自己的话总结归纳，形成一篇连贯的回答。引用具体数据和事实。" :
+  "以上是搜索结果摘要。请综合这些摘要信息回答问题。如果摘要有实质内容就引用，如果只有网站链接就列出来让用户自行查阅。"}
+- 绝对不要说"我无法联网"——资料已经给你了`;
   }
 
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
