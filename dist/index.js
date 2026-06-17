@@ -628,42 +628,7 @@ async function performSearch(query) {
     const slog = (msg) => { log(`[search] ${msg}`); };
     let anyEngineReachable = false;
     let status = "";
-    const isNewsQuery = /news|新闻|动态|进展|大事|\d{4}-\d{2}-\d{2}/.test(query);
-    // Engine 0 (news only): Bing News — real news articles, not encyclopedias
-    if (isNewsQuery) {
-        try {
-            const url = `https://www.bing.com/news/search?q=${encodeURIComponent(query)}&format=rss`;
-            slog(`Bing News...`);
-            const resp = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { "User-Agent": "Mozilla/5.0 (compatible; ClaudeWeixinBot/1.0)" } });
-            const xml = await resp.text();
-            anyEngineReachable = true;
-            // Parse RSS: <item><title>...</title><description>...</description><link>...</link></item>
-            const results = [];
-            const itemRe = /<item>([\s\S]*?)<\/item>/gi;
-            let m;
-            while ((m = itemRe.exec(xml)) !== null && results.length < 8) {
-                const item = m[1];
-                const tm = /<title><!\[CDATA\[([\]]*)\]\]><\/title>|<title>([^<]*)<\/title>/i.exec(item);
-                const sm = /<description><!\[CDATA\[([\]]*)\]\]><\/description>|<description>([^<]*)<\/description>/i.exec(item);
-                const lm = /<link>([^<]*)<\/link>/i.exec(item);
-                const title = (tm?.[1] || tm?.[2] || "").trim();
-                const snippet = (sm?.[1] || sm?.[2] || "").replace(/<[^>]+>/g, "").trim();
-                const link = lm?.[1]?.trim() || "";
-                if (title)
-                    results.push({ title, snippet, url: link });
-            }
-            slog(`Bing News RSS: ${resp.status}, ${results.length} articles`);
-            if (results.length > 0) {
-                searchEngineStatus = "Bing News OK";
-                lastSearchError = "";
-                return results;
-            }
-        }
-        catch (err) {
-            slog(`Bing News err: ${String(err)}`);
-        }
-    }
-    // Engine 1: DDG HTML
+    // Engine 1: DDG HTML — richest results (works from US)
     try {
         const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
         slog(`DDG HTML...`);
@@ -694,27 +659,34 @@ async function performSearch(query) {
     catch (err) {
         slog(`DDG HTML err: ${String(err)}`);
     }
-    // Engine 2: Bing HTML
+    // Engine 2: Bing HTML (current structure, tested 2026-06)
     try {
-        const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10`;
+        const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10&setlang=en`;
         slog(`Bing...`);
-        const resp = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { "User-Agent": "Mozilla/5.0 (compatible; ClaudeWeixinBot/1.0)" } });
+        const resp = await fetch(url, { signal: AbortSignal.timeout(12000), headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "en-US,en;q=0.9" } });
         anyEngineReachable = true;
         const html = await resp.text();
+        slog(`Bing: ${resp.status}, ${html.length}b`);
         const results = [];
-        const re2 = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/gi;
+        // Structure: <li class="b_algo"> ... <a target="_blank" href="URL">TITLE</a> ... <p>SNIPPET</p> ... </li>
+        const blockRe = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/gi;
         let b2;
-        while ((b2 = re2.exec(html)) !== null && results.length < 8) {
+        while ((b2 = blockRe.exec(html)) !== null && results.length < 8) {
             const body = b2[1];
-            const tm = /<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
-            const sm = /<(?:p|div)[^>]*>([\s\S]{15,300}?)<\/(?:p|div)>/i.exec(body);
-            if (tm) {
-                const t = tm[2].replace(/<[^>]+>/g, "").trim();
-                if (t && t.length > 2)
-                    results.push({ title: t, snippet: sm?.[1]?.replace(/<[^>]+>/g, "").trim() || "", url: tm[1].startsWith("http") ? tm[1] : `https://www.bing.com${tm[1]}` });
+            // Title: the second <a> with target="_blank" usually has the clean title
+            const titleM = /<a[^>]*target="_blank"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body)
+                || /<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
+            // Snippet: first <p> with content
+            const snipM = /<p[^>]*>([\s\S]{10,500}?)<\/p>/i.exec(body);
+            if (titleM) {
+                const title = titleM[2].replace(/<[^>]+>/g, "").trim();
+                const url = titleM[1].startsWith("http") ? titleM[1] : `https://www.bing.com${titleM[1]}`;
+                const snippet = snipM ? snipM[1].replace(/<[^>]+>/g, "").trim() : "";
+                if (title && title.length > 3 && !/baidu\.com|百度/.test(title))
+                    results.push({ title, snippet, url });
             }
         }
-        slog(`Bing: ${resp.status}, ${results.length} results`);
+        slog(`Bing: ${results.length} results`);
         status = "Bing OK";
         if (results.length > 0) {
             searchEngineStatus = status;
