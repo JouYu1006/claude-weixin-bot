@@ -1,0 +1,12 @@
+[build]
+  builder = "nixpacks"
+  buildCommand = "npm install"
+  startCommand = "npm start"
+
+[service]
+  healthcheckPath = "/"
+  port = 8080
+
+[deploy]
+  numReplicas = 1
+  restartPolicyType = "always"
