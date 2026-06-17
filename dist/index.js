@@ -588,65 +588,70 @@ async function downloadWeChatImage(info) {
 async function recognizeImage(imageBuffer, userPrompt) {
     const base64 = imageBuffer.toString("base64");
     const mimeType = "image/jpeg";
-    // Try 1: DeepSeek V4 vision API
-    try {
-        const client = new OpenAI({ apiKey: process.env.LLM_API_KEY, baseURL: LLM_BASE_URL });
-        const resp = await client.chat.completions.create({
-            model: CLAUDE_MODEL.includes("v4") ? CLAUDE_MODEL : "deepseek-v4-flash",
-            messages: [{
-                    role: "user",
-                    content: [
-                        { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64}` } },
-                        { type: "text", text: userPrompt || "请描述这张图片的内容，包括里面的文字、物品、场景。" },
-                    ],
-                }],
-            max_tokens: 2048,
-            temperature: 0.3,
-            stream: false,
-        });
-        const text = resp.choices?.[0]?.message?.content || "";
-        if (text.trim()) {
-            log(`✅ DeepSeek vision: ${text.slice(0, 80)}...`);
-            return text;
-        }
-        log(`⚠️ DeepSeek vision returned empty`);
-    }
-    catch (err) {
-        log(`⚠️ DeepSeek vision failed: ${String(err).slice(0, 100)}`);
-    }
-    // Try 2: Groq (free Llama 4 vision — no API key needed? actually needs key but is cheap)
-    const groqKey = process.env.GROQ_API_KEY;
-    if (groqKey) {
+    const msgContent = [
+        { type: "image_url", image_url: { url: "data:" + mimeType + ";base64," + base64 } },
+        { type: "text", text: userPrompt || "请描述这张图片的内容，包括里面的文字、物品、场景。" },
+    ];
+    // Try 1: SiliconFlow (free, accessible from China)
+    const sfKey = process.env.SILICONFLOW_API_KEY;
+    if (sfKey) {
         try {
-            log(`🔄 Groq 视觉 fallback...`);
-            const groq = new OpenAI({ apiKey: groqKey, baseURL: "https://api.groq.com/openai/v1" });
-            const resp = await groq.chat.completions.create({
-                model: "llama-4-scout-17b-16e-instruct",
-                messages: [{
-                        role: "user",
-                        content: [
-                            { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64}` } },
-                            { type: "text", text: userPrompt || "Please describe this image in Chinese. Identify text, objects, and scene." },
-                        ],
-                    }],
-                max_tokens: 2048,
-                temperature: 0.3,
-                stream: false,
+            log("🔄 SiliconFlow...");
+            const sf = new OpenAI({ apiKey: sfKey, baseURL: "https://api.siliconflow.cn/v1" });
+            const resp = await sf.chat.completions.create({
+                model: "Qwen/Qwen3-VL-32B",
+                messages: [{ role: "user", content: msgContent }],
+                max_tokens: 2048, temperature: 0.3, stream: false,
             });
             const text = resp.choices?.[0]?.message?.content || "";
             if (text.trim()) {
-                log(`✅ Groq: ${text.slice(0, 80)}...`);
+                log("✅ SiliconFlow: " + text.slice(0, 60));
                 return text;
             }
         }
         catch (err) {
-            log(`⚠️ Groq fallback failed: ${String(err).slice(0, 80)}`);
+            log("⚠️ SiliconFlow: " + String(err).slice(0, 80));
         }
     }
-    else {
-        log(`ℹ️ 未设置 GROQ_API_KEY，跳过 Groq 视觉 fallback`);
+    // Try 2: DeepSeek V4 vision
+    try {
+        const client = new OpenAI({ apiKey: process.env.LLM_API_KEY, baseURL: LLM_BASE_URL });
+        const resp = await client.chat.completions.create({
+            model: CLAUDE_MODEL,
+            messages: [{ role: "user", content: msgContent }],
+            max_tokens: 2048, temperature: 0.3, stream: false,
+        });
+        const text = resp.choices?.[0]?.message?.content || "";
+        if (text.trim()) {
+            log("✅ DeepSeek: " + text.slice(0, 60));
+            return text;
+        }
     }
-    return "抱歉，DeepSeek 视觉 API 暂不可用。你可以设置 GROQ_API_KEY 环境变量启用免费的 Llama 4 视觉识别。";
+    catch (err) {
+        log("⚠️ DeepSeek: " + String(err).slice(0, 80));
+    }
+    // Try 3: Groq
+    const groqKey = process.env.GROQ_API_KEY;
+    if (groqKey) {
+        try {
+            log("🔄 Groq...");
+            const groq = new OpenAI({ apiKey: groqKey, baseURL: "https://api.groq.com/openai/v1" });
+            const resp = await groq.chat.completions.create({
+                model: "llama-4-scout-17b-16e-instruct",
+                messages: [{ role: "user", content: msgContent }],
+                max_tokens: 2048, temperature: 0.3, stream: false,
+            });
+            const text = resp.choices?.[0]?.message?.content || "";
+            if (text.trim()) {
+                log("✅ Groq: " + text.slice(0, 60));
+                return text;
+            }
+        }
+        catch (err) {
+            log("⚠️ Groq: " + String(err).slice(0, 80));
+        }
+    }
+    return "抱歉，视觉功能需要 API Key。请在 Railway Variables 添加 SILICONFLOW_API_KEY（推荐，国内可注册 cloud.siliconflow.cn）。";
 }
 /** Handle image message: download, decrypt, recognize, reply */
 async function handleImageMessage(msg, fromUser, account) {
