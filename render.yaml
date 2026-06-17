@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: claude-weixin-bot
+    runtime: node
+    buildCommand: npm ci && npx tsc
+    startCommand: node dist/index.js
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        value: https://api.deepseek.com/v1
+      - key: LLM_MODEL
+        value: deepseek-chat
+      - key: ACCOUNT_JSON
+        sync: false
+      - key: PORT
+        value: "10000"

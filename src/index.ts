@@ -148,6 +148,11 @@ function saveJsonFile(filename: string, data: unknown): void {
 }
 
 function loadAccount(): AccountData | null {
+  // Cloud mode: load from env var (one-line JSON, no newlines)
+  const envJson = process.env.ACCOUNT_JSON;
+  if (envJson) {
+    try { return JSON.parse(envJson) as AccountData; } catch { /* fall through */ }
+  }
   return loadJsonFile("account.json");
 }
 
@@ -156,6 +161,8 @@ function saveAccount(acc: AccountData): void {
 }
 
 function loadSyncBuf(): string {
+  const envBuf = process.env.SYNC_BUF;
+  if (envBuf) return envBuf;
   const data = loadJsonFile<{ buf: string }>("sync-buf.json");
   return data?.buf ?? "";
 }
