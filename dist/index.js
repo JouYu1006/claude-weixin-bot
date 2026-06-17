@@ -547,9 +547,11 @@ function shouldSearch(text) {
         return t.slice(1).trim();
     // Auto-detect: time-sensitive / factual keywords
     const triggers = [
-        "今天", "现在", "最近", "最新", "刚刚", "当前", "实时",
-        "新闻", "天气", "股价", "汇率", "热搜", "发生什么",
-        "realtime", "today news", "latest",
+        "今天", "现在", "最近", "最新", "刚刚", "当前", "实时", "目前",
+        "新闻", "天气", "股价", "汇率", "热搜", "发生什么", "发生了什么",
+        "动态", "进展", "更新", "变化", "趋势", "行情",
+        "几点了", "星期几", "日期", "时间",
+        "realtime", "today", "news", "latest", "update",
     ];
     if (triggers.some(kw => t.toLowerCase().includes(kw.toLowerCase())))
         return t;
@@ -648,7 +650,6 @@ function formatSearchResults(query, results) {
  * If yes, search first, then prepend the results to the system prompt.
  * This works with ANY model — no function calling needed.
  */
-const SEARCH_PROMPT_HINT = `\n\n[重要：你已接入联网搜索。下方搜索结果来自互联网，请综合这些信息回答。如果搜索结果不足或不相关，直接基于你的知识回答。]`;
 async function callLLM(userId, userMessage, account) {
     const client = new OpenAI({
         apiKey: process.env.LLM_API_KEY,
@@ -673,22 +674,26 @@ async function callLLM(userId, userMessage, account) {
         log(`🔍 搜索: ${searchQuery}`);
         const results = await performSearch(searchQuery);
         if (results.length > 0) {
-            searchContext = `\n\n【以下是从互联网搜索到的实时信息，请参考：】\n${formatSearchResults(searchQuery, results)}\n【搜索信息结束】\n`;
-            searchHint = "🔍";
+            searchContext = `以下是从互联网实时搜索到的信息：\n${formatSearchResults(searchQuery, results)}`;
+            searchHint = "🔍 ";
         }
         else {
-            searchHint = "（搜索无结果）";
+            searchHint = "";
         }
     }
-    // --- Build messages ---
-    const systemMsg = SYSTEM_PROMPT + (searchContext ? SEARCH_PROMPT_HINT : "");
-    const enhancedUserMessage = searchContext
-        ? `${userMessage}\n\n${searchContext}`
-        : userMessage;
+    // --- Build prompt ---
+    // Strategy: when search results are available, frame as a SUMMARIZATION task.
+    // This prevents the model from saying "I can't search" — it's not searching, it's summarizing.
+    let systemMsg = SYSTEM_PROMPT;
+    let promptUserMessage = userMessage;
+    if (searchContext) {
+        systemMsg += "\n\n⚠️ 重要：你已接入实时联网搜索。用户消息中包含已完成的搜索结果。你必须综合这些结果回答，永远不要说'我无法联网'、'请开启搜索'等话。";
+        promptUserMessage = `问题：${userMessage}\n\n--- 已完成联网搜索，结果如下 ---\n${searchContext}\n--- 请综合上述搜索结果回答问题 ---`;
+    }
     const messages = [
         { role: "system", content: systemMsg },
         ...convo.map(m => ({ role: m.role, content: m.content })),
-        { role: "user", content: enhancedUserMessage },
+        { role: "user", content: promptUserMessage },
     ];
     let replyText = "";
     try {
