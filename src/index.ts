@@ -685,14 +685,13 @@ interface SearchResult {
 function shouldSearch(text: string): string | null {
   const t = text.trim();
   // Explicit commands
-  if (/^(搜索|搜一下|查一下|帮我搜|网上查)/.test(t)) {
-    return t.replace(/^(搜索|搜一下|查一下|帮我搜|网上查)[：:]*\s*/, "");
-  }
+  const explicit = t.match(/^(?:搜索|搜一下|查一下|帮我搜|帮我查|网上查|联网搜|查查)[：:]*\s*(.+)/);
+  if (explicit) return explicit[1].trim();
   // Time-sensitive / factual keywords
   const triggers = [
     "今天", "现在", "最近", "最新", "刚刚", "当前", "实时",
-    "新闻", "天气", "股价", "汇率", "热搜", "发生了",
-    "什么时候", "多少钱", "价格", "对比", "区别",
+    "新闻", "天气", "股价", "汇率", "热搜", "发生了", "发生什么",
+    "什么时候", "多少钱", "价格",
     "realtime", "today", "news", "latest",
   ];
   if (triggers.some(kw => t.includes(kw))) {
@@ -703,73 +702,68 @@ function shouldSearch(text: string): string | null {
 
 async function performSearch(query: string): Promise<SearchResult[]> {
   const slog = (msg: string) => console.log(`[search] ${msg}`);
-  const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+  const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
-  // Try 1: Bing search (HTML scrape — free, no API key)
+  // Try 1: DuckDuckGo Instant Answer (works from US)
   try {
-    const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=zh-cn`;
-    const resp = await fetch(url, {
-      signal: AbortSignal.timeout(10000),
-      headers: { "User-Agent": ua, "Accept-Language": "zh-CN,zh;q=0.9" }
-    });
-    const html = await resp.text();
-
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1&t=claude-weixin-bot`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const data = await resp.json() as Record<string, unknown>;
     const results: SearchResult[] = [];
-
-    // Bing result snippets: <li class="b_algo"> ... <h2><a href="...">title</a></h2> ... <p>snippet</p>
-    const blockRe = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/gi;
-    let block;
-    while ((block = blockRe.exec(html)) !== null && results.length < 6) {
-      const b = block[1];
-      const titleM = /<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(b);
-      const snipM = /<(?:p|div) class="[^"]*b_(?:caption|snippet|lineclamp)[^"]*"[^>]*>([\s\S]*?)<\/(?:p|div)>/i.exec(b)
-        || /<p[^>]*>([\s\S]{20,300}?)<\/p>/i.exec(b);
-      if (titleM) {
-        const title = titleM[2].replace(/<[^>]+>/g, "").trim();
-        const url = titleM[1].startsWith("http") ? titleM[1] : `https://www.bing.com${titleM[1]}`;
-        const snippet = snipM ? snipM[1].replace(/<[^>]+>/g, "").trim() : "";
-        if (title && !title.includes("百度一下")) {
-          results.push({ title, snippet, url });
-        }
+    const abstract = (data.AbstractText as string)?.trim();
+    if (abstract) {
+      results.push({ title: (data.Heading as string) || query, snippet: abstract, url: (data.AbstractURL as string) || "" });
+    }
+    const topics = data.RelatedTopics as Array<{ Text?: string; FirstURL?: string }> | undefined;
+    if (topics) {
+      for (const t of topics) {
+        if (t.Text && results.length < 6) results.push({ title: "", snippet: t.Text, url: t.FirstURL || "" });
       }
     }
+    if (results.length > 0) { slog(`DDG API: ${results.length} results`); return results; }
+  } catch (err) { slog(`DDG API err: ${String(err)}`); }
 
-    if (results.length > 0) {
-      slog(`Bing: ${results.length} results for "${query}"`);
-      return results;
-    }
-  } catch (err) {
-    slog(`Bing failed: ${String(err)}`);
-  }
-
-  // Try 2: DuckDuckGo Lite (works from overseas)
+  // Try 2: DuckDuckGo Lite HTML
   try {
     const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
-    const resp = await fetch(url, {
-      signal: AbortSignal.timeout(10000),
-      headers: { "User-Agent": ua }
-    });
+    const resp = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { "User-Agent": ua } });
     const html = await resp.text();
-
     const results: SearchResult[] = [];
-    const linkRe = /<a[^>]*href="([^"]+)"[^>]*>([^<]+)<\/a>\s*<span[^>]*>([^<]*)<\/span>/g;
-    let m;
-    while ((m = linkRe.exec(html)) !== null && results.length < 6) {
-      results.push({ title: m[2].trim(), snippet: m[3].trim(), url: m[1] });
-    }
-    if (results.length === 0) {
-      const altRe = /<a[^>]*href="([^"]+)"[^>]*>([^<]+)<\/a><br>([^<]+)/gi;
-      let m2;
-      while ((m2 = altRe.exec(html)) !== null && results.length < 6) {
-        results.push({ title: m2[2].trim(), snippet: m2[3].trim(), url: m2[1] });
+    const re = /<a[^>]*href="([^"]+)"[^>]*class="result-link"[^>]*>([^<]+)<\/a>/gi;
+    let m; while ((m = re.exec(html)) !== null && results.length < 6) results.push({ title: m[2].trim(), snippet: "", url: m[1] });
+    if (results.length > 0) { slog(`DDG Lite: ${results.length} results`); return results; }
+  } catch (err) { slog(`DDG Lite err: ${String(err)}`); }
+
+  // Try 3: Bing
+  try {
+    const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=zh-cn&count=10`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { "User-Agent": ua, "Accept-Language": "zh-CN" } });
+    const html = await resp.text();
+    const results: SearchResult[] = [];
+    const blockRe = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/gi;
+    let b; while ((b = blockRe.exec(html)) !== null && results.length < 6) {
+      const body = b[1];
+      const tm = /<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
+      const sm = /<(?:p|div)[^>]*>([\s\S]{20,400}?)<\/(?:p|div)>/i.exec(body);
+      if (tm) {
+        const title = tm[2].replace(/<[^>]+>/g, "").trim();
+        if (title && title.length > 2) results.push({ title, snippet: sm?.[1]?.replace(/<[^>]+>/g, "").trim() || "", url: tm[1] });
       }
     }
-    slog(`DuckDuckGo: ${results.length} results for "${query}"`);
-    return results;
-  } catch (err) {
-    slog(`DuckDuckGo failed: ${String(err)}`);
-  }
+    if (results.length > 0) { slog(`Bing: ${results.length} results`); return results; }
+  } catch (err) { slog(`Bing err: ${String(err)}`); }
 
+  // Try 4: SearXNG public instance
+  try {
+    const url = `https://search.sapti.me/search?q=${encodeURIComponent(query)}&format=json&lang=zh-CN`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const data = await resp.json() as { results?: Array<{ title?: string; content?: string; url?: string }> };
+    const raw = data.results || [];
+    const results: SearchResult[] = raw.slice(0, 6).map(r => ({ title: r.title || "", snippet: r.content || "", url: r.url || "" }));
+    if (results.length > 0) { slog(`SearXNG: ${results.length} results`); return results; }
+  } catch (err) { slog(`SearXNG err: ${String(err)}`); }
+
+  slog(`ALL search engines failed for "${query}"`);
   return [];
 }
 
@@ -817,12 +811,16 @@ async function callLLM(
 
   // --- Decide whether to search first ---
   let searchContext = "";
+  let searchHint = "";
   const searchQuery = shouldSearch(userMessage);
   if (searchQuery) {
     log(`🔍 搜索: ${searchQuery}`);
     const results = await performSearch(searchQuery);
     if (results.length > 0) {
       searchContext = `\n\n【以下是从互联网搜索到的实时信息，请参考：】\n${formatSearchResults(searchQuery, results)}\n【搜索信息结束】\n`;
+      searchHint = "🔍";
+    } else {
+      searchHint = "（搜索无结果）";
     }
   }
 
