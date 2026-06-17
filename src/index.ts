@@ -681,23 +681,25 @@ interface SearchResult {
   url: string;
 }
 
-const WEB_SEARCH_TOOL = {
-  type: "function" as const,
-  function: {
-    name: "web_search",
-    description: "搜索互联网获取实时信息。当用户的问题需要最新数据、新闻、事实核查，或者你无法确定答案时使用。",
-    parameters: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description: "搜索关键词，用中文或英文。尽量简洁精准。"
-        }
-      },
-      required: ["query"]
-    }
+/** Heuristic: does this message likely need a web search? */
+function shouldSearch(text: string): string | null {
+  const t = text.trim();
+  // Explicit commands
+  if (/^(搜索|搜一下|查一下|帮我搜|网上查)/.test(t)) {
+    return t.replace(/^(搜索|搜一下|查一下|帮我搜|网上查)[：:]*\s*/, "");
   }
-};
+  // Time-sensitive / factual keywords
+  const triggers = [
+    "今天", "现在", "最近", "最新", "刚刚", "当前", "实时",
+    "新闻", "天气", "股价", "汇率", "热搜", "发生了",
+    "什么时候", "多少钱", "价格", "对比", "区别",
+    "realtime", "today", "news", "latest",
+  ];
+  if (triggers.some(kw => t.includes(kw))) {
+    return t;
+  }
+  return null;
+}
 
 async function performSearch(query: string): Promise<SearchResult[]> {
   const log = (msg: string) => process.stdout.write(`[search] ${msg}\n`);
@@ -777,14 +779,16 @@ function formatSearchResults(query: string, results: SearchResult[]): string {
 }
 
 // ---------------------------------------------------------------------------
-// LLM call with function calling
+// LLM call — search-before-answer strategy
 // ---------------------------------------------------------------------------
 
-const SEARCH_SYSTEM_EXTRA = `\n\n你可以使用 web_search 工具搜索互联网获取实时信息。遇到以下情况请主动搜索：
-- 需要最新数据（新闻、股价、天气等）
-- 时事、近期事件
-- 你知识截止日期之后的信息
-- 用户明确要求搜索或查资料时`;
+/**
+ * Before calling the LLM, check if the message likely needs web search.
+ * If yes, search first, then prepend the results to the system prompt.
+ * This works with ANY model — no function calling needed.
+ */
+
+const SEARCH_PROMPT_HINT = `\n\n[重要：你已接入联网搜索。下方搜索结果来自互联网，请综合这些信息回答。如果搜索结果不足或不相关，直接基于你的知识回答。]`;
 
 async function callLLM(
   userId: string,
@@ -797,6 +801,7 @@ async function callLLM(
   });
   const convo = getConversation(userId);
 
+  // "typing..." indicator
   const config = await getConfig({
     baseUrl: account.baseUrl,
     token: account.botToken,
@@ -807,77 +812,42 @@ async function callLLM(
     sendTyping({ baseUrl: account.baseUrl, token: account.botToken, ilinkUserId: userId, typingTicket: config.typing_ticket, status: 1 }).catch(() => {});
   }
 
-  const systemMsg = SYSTEM_PROMPT + SEARCH_SYSTEM_EXTRA;
+  // --- Decide whether to search first ---
+  let searchContext = "";
+  const searchQuery = shouldSearch(userMessage);
+  if (searchQuery) {
+    log(`🔍 搜索: ${searchQuery}`);
+    const results = await performSearch(searchQuery);
+    if (results.length > 0) {
+      searchContext = `\n\n【以下是从互联网搜索到的实时信息，请参考：】\n${formatSearchResults(searchQuery, results)}\n【搜索信息结束】\n`;
+    }
+  }
+
+  // --- Build messages ---
+  const systemMsg = SYSTEM_PROMPT + (searchContext ? SEARCH_PROMPT_HINT : "");
+  const enhancedUserMessage = searchContext
+    ? `${userMessage}\n\n${searchContext}`
+    : userMessage;
+
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
     { role: "system", content: systemMsg },
     ...convo.map(m => ({ role: m.role as "user" | "assistant", content: m.content })),
-    { role: "user", content: userMessage },
+    { role: "user", content: enhancedUserMessage },
   ];
 
   let replyText = "";
 
   try {
-    // Round 1: Try function calling (non-streaming)
-    const resp1 = await client.chat.completions.create({
+    const stream = await client.chat.completions.create({
       model: CLAUDE_MODEL,
       messages,
       max_tokens: 4096,
-      tools: [WEB_SEARCH_TOOL],
+      stream: true,
     });
 
-    const choice1 = resp1.choices?.[0];
-    const toolCalls = choice1?.message?.tool_calls;
-
-    if (toolCalls && toolCalls.length > 0) {
-      // Execute searches
-      messages.push(choice1.message);
-      for (const tc of toolCalls) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const tcAny = tc as any;
-        const name = tcAny.function?.name;
-        if (name === "web_search") {
-          const args = JSON.parse(tcAny.function?.arguments || "{}");
-          const query = args.query || userMessage;
-          log(`🔍 搜索: ${query}`);
-          const results = await performSearch(query);
-          const formatted = formatSearchResults(query, results);
-          messages.push({
-            role: "tool",
-            tool_call_id: tc.id,
-            content: formatted,
-          });
-        }
-      }
-
-      // Round 2: Get final answer with search results (streaming)
-      const resp2 = await client.chat.completions.create({
-        model: CLAUDE_MODEL,
-        messages,
-        max_tokens: 4096,
-        stream: true,
-      });
-
-      for await (const chunk of resp2) {
-        const delta = chunk.choices?.[0]?.delta?.content;
-        if (delta) replyText += delta;
-      }
-    } else {
-      // No tool call — collect content from first response
-      replyText = choice1?.message?.content || "";
-
-      // If the model didn't use tools but the response is empty, fallback to plain completion
-      if (!replyText.trim()) {
-        const fallback = await client.chat.completions.create({
-          model: CLAUDE_MODEL,
-          messages,
-          max_tokens: 4096,
-          stream: true,
-        });
-        for await (const chunk of fallback) {
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) replyText += delta;
-        }
-      }
+    for await (const chunk of stream) {
+      const delta = chunk.choices?.[0]?.delta?.content;
+      if (delta) replyText += delta;
     }
 
     // Stop typing
@@ -885,6 +855,7 @@ async function callLLM(
       sendTyping({ baseUrl: account.baseUrl, token: account.botToken, ilinkUserId: userId, typingTicket: config.typing_ticket, status: 2 }).catch(() => {});
     }
 
+    // Store conversation (original message, not the search-augmented one)
     convo.push({ role: "user", content: userMessage });
     convo.push({ role: "assistant", content: replyText });
     trimConversation(convo);
