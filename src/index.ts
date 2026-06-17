@@ -702,57 +702,61 @@ function shouldSearch(text: string): string | null {
 }
 
 async function performSearch(query: string): Promise<SearchResult[]> {
-  const log = (msg: string) => process.stdout.write(`[search] ${msg}\n`);
+  const slog = (msg: string) => console.log(`[search] ${msg}`);
+  const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+  // Try 1: Bing search (HTML scrape — free, no API key)
   try {
-    // DuckDuckGo Instant Answer API
-    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    const data = await resp.json() as Record<string, unknown>;
+    const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=zh-cn`;
+    const resp = await fetch(url, {
+      signal: AbortSignal.timeout(10000),
+      headers: { "User-Agent": ua, "Accept-Language": "zh-CN,zh;q=0.9" }
+    });
+    const html = await resp.text();
 
     const results: SearchResult[] = [];
 
-    // Abstract (instant answer)
-    const abstract = (data.AbstractText as string)?.trim();
-    if (abstract) {
-      results.push({ title: data.Heading as string || query, snippet: abstract, url: (data.AbstractURL as string) || "" });
-    }
-
-    // Related topics
-    const topics = data.RelatedTopics as Array<{ Text?: string; FirstURL?: string }> | undefined;
-    if (topics) {
-      for (const t of topics) {
-        if (t.Text && results.length < 8) {
-          results.push({ title: "", snippet: t.Text, url: t.FirstURL || "" });
+    // Bing result snippets: <li class="b_algo"> ... <h2><a href="...">title</a></h2> ... <p>snippet</p>
+    const blockRe = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/gi;
+    let block;
+    while ((block = blockRe.exec(html)) !== null && results.length < 6) {
+      const b = block[1];
+      const titleM = /<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(b);
+      const snipM = /<(?:p|div) class="[^"]*b_(?:caption|snippet|lineclamp)[^"]*"[^>]*>([\s\S]*?)<\/(?:p|div)>/i.exec(b)
+        || /<p[^>]*>([\s\S]{20,300}?)<\/p>/i.exec(b);
+      if (titleM) {
+        const title = titleM[2].replace(/<[^>]+>/g, "").trim();
+        const url = titleM[1].startsWith("http") ? titleM[1] : `https://www.bing.com${titleM[1]}`;
+        const snippet = snipM ? snipM[1].replace(/<[^>]+>/g, "").trim() : "";
+        if (title && !title.includes("百度一下")) {
+          results.push({ title, snippet, url });
         }
       }
     }
 
     if (results.length > 0) {
-      log(`DuckDuckGo: ${results.length} results for "${query}"`);
+      slog(`Bing: ${results.length} results for "${query}"`);
       return results;
     }
   } catch (err) {
-    log(`DuckDuckGo failed: ${String(err)}, trying Lite...`);
+    slog(`Bing failed: ${String(err)}`);
   }
 
-  // Fallback: DuckDuckGo Lite HTML scrape
+  // Try 2: DuckDuckGo Lite (works from overseas)
   try {
     const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
     const resp = await fetch(url, {
       signal: AbortSignal.timeout(10000),
-      headers: { "User-Agent": "Mozilla/5.0" }
+      headers: { "User-Agent": ua }
     });
     const html = await resp.text();
 
     const results: SearchResult[] = [];
-    // Parse Lite results: <a rel="nofollow" href="...">title</a><span>snippet</span>
     const linkRe = /<a[^>]*href="([^"]+)"[^>]*>([^<]+)<\/a>\s*<span[^>]*>([^<]*)<\/span>/g;
     let m;
     while ((m = linkRe.exec(html)) !== null && results.length < 6) {
       results.push({ title: m[2].trim(), snippet: m[3].trim(), url: m[1] });
     }
-
-    // Also try: <a rel="nofollow" href="...">title</a><br>snippet<br>
     if (results.length === 0) {
       const altRe = /<a[^>]*href="([^"]+)"[^>]*>([^<]+)<\/a><br>([^<]+)/gi;
       let m2;
@@ -760,11 +764,10 @@ async function performSearch(query: string): Promise<SearchResult[]> {
         results.push({ title: m2[2].trim(), snippet: m2[3].trim(), url: m2[1] });
       }
     }
-
-    log(`DuckDuckGo Lite: ${results.length} results for "${query}"`);
+    slog(`DuckDuckGo: ${results.length} results for "${query}"`);
     return results;
   } catch (err) {
-    log(`DuckDuckGo Lite failed: ${String(err)}`);
+    slog(`DuckDuckGo failed: ${String(err)}`);
   }
 
   return [];
