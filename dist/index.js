@@ -565,22 +565,59 @@ function optimizeSearchQuery(raw) {
     const hasChinese = /[一-鿿]/.test(raw);
     if (!hasChinese)
         return raw;
-    const year = new Date().getFullYear();
-    const month = new Date().getMonth() + 1;
-    let q = raw
-        .replace(/[？?!！。，,、]/g, " ")
-        .replace(/(有什么|是什么|怎么样|如何|有哪些|帮我|搜一下|查一下|最近|最新的)/g, "")
+    const now = new Date();
+    const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    // Detect intent and build clean English query
+    const isNews = /新闻|动态|最新|今天|最近|进展|大事/.test(raw);
+    const isTech = /科技|技术|AI|人工智能|数码|手机|电脑|软件/.test(raw);
+    const isWeather = /天气|气温|下雨|台风/.test(raw);
+    const isStock = /股价|股票|大盘|基金|币|行情/.test(raw);
+    const isSport = /比赛|足球|篮球|NBA|英超|中超|体育/.test(raw);
+    // Extract meaningful nouns (keep English words and Chinese characters)
+    const cleanChinese = raw
+        .replace(/[？?!！。，,、\s]+/g, " ")
+        .replace(/(有什么|是什么|怎么样|如何|有哪些|帮我|搜一下|查一下|一下|吗|吧|最近|最新|今天|现在|的)/g, "")
+        .replace(/\s{2,}/g, " ")
         .trim();
-    // For news queries: add English keywords + year for recency
-    if (/新闻|动态|进展|发生/.test(raw))
-        q = `${q} ${year}年${month}月`;
-    if (/科技|技术|AI|人工智能/.test(raw))
-        q = `technology ${q}`;
-    if (/天气/.test(raw))
-        q = `${q} weather today`;
-    if (/股价|股票/.test(raw))
-        q = `${q} stock price`;
-    return q.trim();
+    // Extract any English/alphanumeric words (product names, model numbers, etc.)
+    const engWords = raw.match(/[A-Za-z0-9]+/g)?.join(" ") || "";
+    let q = "";
+    if (isWeather) {
+        q = `weather forecast today`;
+    }
+    else if (isStock) {
+        q = engWords ? `${engWords} stock price` : "stock market";
+        if (cleanChinese.length > 2)
+            q += ` ${cleanChinese}`;
+    }
+    else if (isSport) {
+        q = engWords ? `${engWords} sports` : `sports news ${dateStr}`;
+    }
+    else if (isTech && isNews) {
+        q = `latest technology news ${dateStr}`;
+        if (engWords)
+            q = `${engWords} ${q}`;
+    }
+    else if (isNews) {
+        q = `latest news ${dateStr}`;
+        if (engWords)
+            q = `${engWords} ${q}`;
+    }
+    else if (isTech) {
+        q = engWords ? `${engWords} technology` : `technology`;
+        if (cleanChinese.length > 2 && cleanChinese !== engWords)
+            q += ` ${cleanChinese}`;
+    }
+    else {
+        // General: merge English words + cleaned Chinese, deduplicating
+        const parts = new Set();
+        if (engWords)
+            engWords.split(/\s+/).forEach(w => parts.add(w.toLowerCase()));
+        cleanChinese.split(/\s+/).forEach(w => { const l = w.toLowerCase(); if (!parts.has(l))
+            parts.add(w); });
+        q = [...parts].join(" ");
+    }
+    return q || raw.replace(/[？?!！。，,、]/g, " ").trim();
 }
 let searchEngineStatus = "未检测";
 let lastSearchError = "";
@@ -756,8 +793,21 @@ async function fetchPageText(url) {
  * Fetch full text of top N search results for deep summarization.
  * Returns concatenated page contents with source attribution.
  */
+/** Filter out junk domains that don't contain useful article text */
+const JUNK_DOMAINS = [
+    "amazon.", "ebay.", "etsy.", "walmart.", "bestbuy.", "target.",
+    "youtube.", "vimeo.", "reddit.", "twitter.", "facebook.", "instagram.",
+    "wikipedia.org", "britannica.com", "dictionary.com",
+    "pinterest.", "tripadvisor.", "booking.com"
+];
+function isNewsWorthy(url) {
+    const lower = url.toLowerCase();
+    return !JUNK_DOMAINS.some(d => lower.includes(d));
+}
 async function fetchTopPages(results, maxPages = 3) {
-    const urls = results.filter(r => r.url && !r.url.includes("duckduckgo.com")).slice(0, maxPages);
+    const urls = results
+        .filter(r => r.url && !r.url.includes("duckduckgo.com") && isNewsWorthy(r.url))
+        .slice(0, maxPages);
     if (urls.length === 0)
         return "";
     log(`📄 抓取 ${urls.length} 个页面全文...`);
