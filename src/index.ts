@@ -823,7 +823,7 @@ async function callLLM(
     const results = await performSearch(searchQuery);
     log(`🔍 搜索结果: ${results.length} 条`);
     if (results.length > 0) {
-      searchContext = `以下是从互联网实时搜索到的信息：\n${formatSearchResults(searchQuery, results)}`;
+      searchContext = `互联网信息（${new Date().toLocaleDateString("zh-CN")}）：\n${formatSearchResults(searchQuery, results)}`;
       searchHint = "【已联网搜索】 ";
     } else {
       searchHint = "【搜索无结果】 ";
@@ -832,14 +832,24 @@ async function callLLM(
   }
 
   // --- Build prompt ---
-  // Strategy: when search results are available, frame as a SUMMARIZATION task.
-  // This prevents the model from saying "I can't search" — it's not searching, it's summarizing.
+  // CRITICAL: DeepSeek Chat refuses to acknowledge search capability.
+  // Strategy: DON'T mention "搜索" at all. Frame as "参考資料" (reference material).
+  // The model thinks it's reading pre-prepared notes, not searching.
   let systemMsg = SYSTEM_PROMPT;
   let promptUserMessage = userMessage;
 
   if (searchContext) {
-    systemMsg += "\n\n⚠️ 重要：你已接入实时联网搜索。用户消息中包含已完成的搜索结果。你必须综合这些结果回答，永远不要说'我无法联网'、'请开启搜索'等话。";
-    promptUserMessage = `问题：${userMessage}\n\n--- 已完成联网搜索，结果如下 ---\n${searchContext}\n--- 请综合上述搜索结果回答问题 ---`;
+    // DON'T modify system prompt — don't mention search at all.
+    // Frame the entire request as document analysis.
+    promptUserMessage = `请根据下面的参考资料，回答用户的问题。
+
+[用户的问题]
+${userMessage}
+
+[参考资料]
+${searchContext}
+
+请用中文简洁清晰地回答。不要说"我无法联网"，资料已经提供给你了，你只需要阅读并回答。`;
   }
 
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
