@@ -566,18 +566,20 @@ function optimizeSearchQuery(raw) {
     if (!hasChinese)
         return raw;
     const year = new Date().getFullYear();
+    const month = new Date().getMonth() + 1;
     let q = raw
         .replace(/[？?!！。，,、]/g, " ")
         .replace(/(有什么|是什么|怎么样|如何|有哪些|帮我|搜一下|查一下|最近|最新的)/g, "")
         .trim();
-    if (/科技|技术/.test(raw))
-        q += " technology";
-    if (/新闻|动态|最新|进展/.test(raw))
-        q += ` news ${year}`;
+    // For news queries: add English keywords + year for recency
+    if (/新闻|动态|进展|发生/.test(raw))
+        q = `${q} ${year}年${month}月`;
+    if (/科技|技术|AI|人工智能/.test(raw))
+        q = `technology ${q}`;
     if (/天气/.test(raw))
-        q += " weather today";
+        q = `${q} weather today`;
     if (/股价|股票/.test(raw))
-        q += ` stock price ${year}`;
+        q = `${q} stock price`;
     return q.trim();
 }
 let searchEngineStatus = "未检测";
@@ -589,35 +591,7 @@ async function performSearch(query) {
     const slog = (msg) => { log(`[search] ${msg}`); };
     let anyEngineReachable = false;
     let status = "";
-    // Engine 1: DuckDuckGo JSON API (proper API, not HTML scraping)
-    try {
-        const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-        slog(`DDG JSON...`);
-        const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
-        const data = await resp.json();
-        anyEngineReachable = true;
-        const results = [];
-        const abs = data.AbstractText?.trim();
-        if (abs)
-            results.push({ title: data.Heading || query, snippet: abs, url: data.AbstractURL || `https://duckduckgo.com/?q=${encodeURIComponent(query)}` });
-        const related = data.RelatedTopics;
-        if (related)
-            for (const r of related) {
-                if (r.Text && results.length < 6)
-                    results.push({ title: "", snippet: r.Text.replace(/<[^>]+>/g, ""), url: r.FirstURL || "" });
-            }
-        slog(`DDG JSON: ${resp.status}, abstract=${abs ? "yes" : "no"}, related=${related?.length || 0}, results=${results.length}`);
-        status = "DDG JSON OK";
-        if (results.length > 0) {
-            searchEngineStatus = status;
-            lastSearchError = "";
-            return results;
-        }
-    }
-    catch (err) {
-        slog(`DDG JSON err: ${String(err)}`);
-    }
-    // Engine 2: DDG HTML
+    // Engine 1: DDG HTML — richest snippets, most useful for LLM
     try {
         const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
         slog(`DDG HTML...`);
@@ -627,7 +601,7 @@ async function performSearch(query) {
         const results = [];
         const re = /class="result__body"[^>]*>([\s\S]*?)<\/td>/gi;
         let b;
-        while ((b = re.exec(html)) !== null && results.length < 6) {
+        while ((b = re.exec(html)) !== null && results.length < 8) {
             const body = b[1];
             const tm = /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
             const sm = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
@@ -648,7 +622,7 @@ async function performSearch(query) {
     catch (err) {
         slog(`DDG HTML err: ${String(err)}`);
     }
-    // Engine 3: Bing
+    // Engine 2: Bing HTML
     try {
         const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10`;
         slog(`Bing...`);
@@ -658,7 +632,7 @@ async function performSearch(query) {
         const results = [];
         const re2 = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/gi;
         let b2;
-        while ((b2 = re2.exec(html)) !== null && results.length < 6) {
+        while ((b2 = re2.exec(html)) !== null && results.length < 8) {
             const body = b2[1];
             const tm = /<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
             const sm = /<(?:p|div)[^>]*>([\s\S]{15,300}?)<\/(?:p|div)>/i.exec(body);
@@ -678,6 +652,39 @@ async function performSearch(query) {
     }
     catch (err) {
         slog(`Bing err: ${String(err)}`);
+    }
+    // Engine 3: DDG JSON (instant answers only — for facts, not news)
+    try {
+        const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+        slog(`DDG JSON...`);
+        const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+        const data = await resp.json();
+        anyEngineReachable = true;
+        const results = [];
+        const abs = data.AbstractText?.trim();
+        if (abs)
+            results.push({ title: data.Heading || query, snippet: abs, url: data.AbstractURL || "" });
+        // Only include RelatedTopics if they contain real content (not just links)
+        const related = data.RelatedTopics;
+        if (related)
+            for (const r of related) {
+                if (r.Text && results.length < 6) {
+                    const clean = r.Text.replace(/<[^>]+>/g, "").trim();
+                    // Skip entries that are just link descriptions (no real content)
+                    if (clean.length > 30)
+                        results.push({ title: "", snippet: clean, url: r.FirstURL || "" });
+                }
+            }
+        slog(`DDG JSON: ${resp.status}, abstract=${abs ? "yes" : "no"}, useful=${results.length}`);
+        status = "DDG JSON OK";
+        if (results.length > 0) {
+            searchEngineStatus = status;
+            lastSearchError = "";
+            return results;
+        }
+    }
+    catch (err) {
+        slog(`DDG JSON err: ${String(err)}`);
     }
     searchEngineStatus = anyEngineReachable ? `${status} (空结果)` : "ALL DEAD";
     lastSearchError = anyEngineReachable ? "" : "全部搜索引擎无法连接";
@@ -754,17 +761,18 @@ async function callLLM(userId, userMessage, account) {
     let systemMsg = SYSTEM_PROMPT;
     let promptUserMessage = userMessage;
     if (searchContext) {
-        // DON'T modify system prompt — don't mention search at all.
-        // Frame the entire request as document analysis.
-        promptUserMessage = `请根据下面的参考资料，回答用户的问题。
+        promptUserMessage = `以下是你收到的参考资料，请根据这些资料回答用户的问题。
 
-[用户的问题]
+【用户的问题】
 ${userMessage}
 
-[参考资料]
+【参考资料】
 ${searchContext}
 
-请用中文简洁清晰地回答。不要说"我无法联网"，资料已经提供给你了，你只需要阅读并回答。`;
+【重要指引】
+- 如果资料包含具体信息，直接引用并回答
+- 如果资料只有网站链接没有内容，告诉用户可以去哪些网站查看，并列出网站名称
+- 绝对不要说你不能搜索——资料已经给你了`;
     }
     const messages = [
         { role: "system", content: systemMsg },
