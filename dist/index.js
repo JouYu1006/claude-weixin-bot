@@ -560,6 +560,26 @@ function shouldSearch(text) {
 /**
  * Search engine status (set by startup self-test, visible via /diag)
  */
+/** Improve Chinese queries for English search engines */
+function optimizeSearchQuery(raw) {
+    const hasChinese = /[一-鿿]/.test(raw);
+    if (!hasChinese)
+        return raw;
+    const year = new Date().getFullYear();
+    let q = raw
+        .replace(/[？?!！。，,、]/g, " ")
+        .replace(/(有什么|是什么|怎么样|如何|有哪些|帮我|搜一下|查一下|最近|最新的)/g, "")
+        .trim();
+    if (/科技|技术/.test(raw))
+        q += " technology";
+    if (/新闻|动态|最新|进展/.test(raw))
+        q += ` news ${year}`;
+    if (/天气/.test(raw))
+        q += " weather today";
+    if (/股价|股票/.test(raw))
+        q += ` stock price ${year}`;
+    return q.trim();
+}
 let searchEngineStatus = "未检测";
 let lastSearchError = "";
 /**
@@ -714,7 +734,9 @@ async function callLLM(userId, userMessage, account) {
     const searchQuery = shouldSearch(userMessage);
     if (searchQuery) {
         log(`🔍 搜索触发: "${searchQuery}"`);
-        const results = await performSearch(searchQuery);
+        const optimized = optimizeSearchQuery(searchQuery);
+        log(`🔍 优化后: "${optimized}"`);
+        const results = await performSearch(optimized);
         log(`🔍 搜索结果: ${results.length} 条`);
         if (results.length > 0) {
             searchContext = `互联网信息（${new Date().toLocaleDateString("zh-CN")}）：\n${formatSearchResults(searchQuery, results)}`;
