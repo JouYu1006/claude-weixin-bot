@@ -628,7 +628,42 @@ async function performSearch(query) {
     const slog = (msg) => { log(`[search] ${msg}`); };
     let anyEngineReachable = false;
     let status = "";
-    // Engine 1: DDG HTML — richest snippets, most useful for LLM
+    const isNewsQuery = /news|新闻|动态|进展|大事|\d{4}-\d{2}-\d{2}/.test(query);
+    // Engine 0 (news only): Bing News — real news articles, not encyclopedias
+    if (isNewsQuery) {
+        try {
+            const url = `https://www.bing.com/news/search?q=${encodeURIComponent(query)}&format=rss`;
+            slog(`Bing News...`);
+            const resp = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { "User-Agent": "Mozilla/5.0 (compatible; ClaudeWeixinBot/1.0)" } });
+            const xml = await resp.text();
+            anyEngineReachable = true;
+            // Parse RSS: <item><title>...</title><description>...</description><link>...</link></item>
+            const results = [];
+            const itemRe = /<item>([\s\S]*?)<\/item>/gi;
+            let m;
+            while ((m = itemRe.exec(xml)) !== null && results.length < 8) {
+                const item = m[1];
+                const tm = /<title><!\[CDATA\[([\]]*)\]\]><\/title>|<title>([^<]*)<\/title>/i.exec(item);
+                const sm = /<description><!\[CDATA\[([\]]*)\]\]><\/description>|<description>([^<]*)<\/description>/i.exec(item);
+                const lm = /<link>([^<]*)<\/link>/i.exec(item);
+                const title = (tm?.[1] || tm?.[2] || "").trim();
+                const snippet = (sm?.[1] || sm?.[2] || "").replace(/<[^>]+>/g, "").trim();
+                const link = lm?.[1]?.trim() || "";
+                if (title)
+                    results.push({ title, snippet, url: link });
+            }
+            slog(`Bing News RSS: ${resp.status}, ${results.length} articles`);
+            if (results.length > 0) {
+                searchEngineStatus = "Bing News OK";
+                lastSearchError = "";
+                return results;
+            }
+        }
+        catch (err) {
+            slog(`Bing News err: ${String(err)}`);
+        }
+    }
+    // Engine 1: DDG HTML
     try {
         const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
         slog(`DDG HTML...`);
@@ -859,43 +894,39 @@ async function callLLM(userId, userMessage, account) {
         const results = await performSearch(optimized);
         log(`🔍 搜索结果: ${results.length} 条`);
         if (results.length > 0) {
-            searchContext = `搜索摘要（${new Date().toLocaleDateString("zh-CN")}）：\n${formatSearchResults(searchQuery, results)}`;
+            searchContext = `（${new Date().toLocaleDateString("zh-CN")}）：\n${formatSearchResults(searchQuery, results)}`;
             // Fetch full content from top 3 pages
             const fullPages = await fetchTopPages(results, 3);
             if (fullPages) {
-                searchContext += `\n\n--- 以下为页面全文 ---\n${fullPages}`;
-                searchHint = "【已联网搜索+全文】 ";
+                searchContext += `\n\n--- 详细内容 ---\n${fullPages}`;
+                searchHint = "📡 ";
             }
             else {
-                searchHint = "【已联网搜索】 ";
+                searchHint = "📡 ";
             }
         }
         else {
-            searchHint = "【搜索无结果】 ";
+            searchHint = "";
             log(`⚠️ 所有搜索引擎均失败`);
         }
     }
     // --- Build prompt ---
-    // CRITICAL: DeepSeek Chat refuses to acknowledge search capability.
-    // Strategy: DON'T mention "搜索" at all. Frame as "参考資料" (reference material).
-    // The model thinks it's reading pre-prepared notes, not searching.
+    // Strategy: Don't say "search" or "web" or "资料". Just splice results into the user message
+    // as if the user copy-pasted them. DeepSeek can't refuse to read user-provided text.
     let systemMsg = SYSTEM_PROMPT;
     let promptUserMessage = userMessage;
     if (searchContext) {
-        const hasFullPages = searchContext.includes("页面全文");
-        promptUserMessage = `你拥有了来自互联网的资料。请基于这些资料回答用户的问题。
+        // Rewrite the entire user message: results ARE the user message now
+        const cleanResults = searchContext
+            .replace(/搜索/g, "")
+            .replace(/互联网/g, "")
+            .replace(/联网/g, "")
+            .replace(/抓取/g, "");
+        promptUserMessage = `我整理了一些相关内容，帮我看看并回答：
 
-【用户的问题】
-${userMessage}
+${cleanResults}
 
-【参考资料】
-${searchContext}
-
-【核心任务】
-${hasFullPages ?
-            "以上资料包含完整页面内容。请仔细阅读页面全文，提取与用户问题相关的关键信息，用你自己的话总结归纳，形成一篇连贯的回答。引用具体数据和事实。" :
-            "以上是搜索结果摘要。请综合这些摘要信息回答问题。如果摘要有实质内容就引用，如果只有网站链接就列出来让用户自行查阅。"}
-- 绝对不要说"我无法联网"——资料已经给你了`;
+--- 请帮我总结以上内容的要点，用中文回答 ---`;
     }
     const messages = [
         { role: "system", content: systemMsg },
