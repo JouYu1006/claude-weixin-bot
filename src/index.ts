@@ -646,7 +646,7 @@ const LLM_BASE_URL = process.env.LLM_BASE_URL || "https://api.deepseek.com/v1";
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "你是一个微信 AI 助手。请用简洁、友好的中文回复。回答要有条理，避免冗长。";
 
 // Per-user conversation history (max 100 users, LRU eviction)
-type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+type ChatMessage = { role: "system" | "user" | "assistant" | "tool"; content: string; tool_call_id?: string };
 const conversations = new Map<string, ChatMessage[]>();
 const MAX_CONVERSATION_PAIRS = 20; // 20 round-trips = 40 messages
 const MAX_USERS = 100;
@@ -671,6 +671,121 @@ function trimConversation(convo: ChatMessage[]): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Web Search (DuckDuckGo — free, no API key)
+// ---------------------------------------------------------------------------
+
+interface SearchResult {
+  title: string;
+  snippet: string;
+  url: string;
+}
+
+const WEB_SEARCH_TOOL = {
+  type: "function" as const,
+  function: {
+    name: "web_search",
+    description: "搜索互联网获取实时信息。当用户的问题需要最新数据、新闻、事实核查，或者你无法确定答案时使用。",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "搜索关键词，用中文或英文。尽量简洁精准。"
+        }
+      },
+      required: ["query"]
+    }
+  }
+};
+
+async function performSearch(query: string): Promise<SearchResult[]> {
+  const log = (msg: string) => process.stdout.write(`[search] ${msg}\n`);
+  try {
+    // DuckDuckGo Instant Answer API
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const data = await resp.json() as Record<string, unknown>;
+
+    const results: SearchResult[] = [];
+
+    // Abstract (instant answer)
+    const abstract = (data.AbstractText as string)?.trim();
+    if (abstract) {
+      results.push({ title: data.Heading as string || query, snippet: abstract, url: (data.AbstractURL as string) || "" });
+    }
+
+    // Related topics
+    const topics = data.RelatedTopics as Array<{ Text?: string; FirstURL?: string }> | undefined;
+    if (topics) {
+      for (const t of topics) {
+        if (t.Text && results.length < 8) {
+          results.push({ title: "", snippet: t.Text, url: t.FirstURL || "" });
+        }
+      }
+    }
+
+    if (results.length > 0) {
+      log(`DuckDuckGo: ${results.length} results for "${query}"`);
+      return results;
+    }
+  } catch (err) {
+    log(`DuckDuckGo failed: ${String(err)}, trying Lite...`);
+  }
+
+  // Fallback: DuckDuckGo Lite HTML scrape
+  try {
+    const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
+    const resp = await fetch(url, {
+      signal: AbortSignal.timeout(10000),
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
+    const html = await resp.text();
+
+    const results: SearchResult[] = [];
+    // Parse Lite results: <a rel="nofollow" href="...">title</a><span>snippet</span>
+    const linkRe = /<a[^>]*href="([^"]+)"[^>]*>([^<]+)<\/a>\s*<span[^>]*>([^<]*)<\/span>/g;
+    let m;
+    while ((m = linkRe.exec(html)) !== null && results.length < 6) {
+      results.push({ title: m[2].trim(), snippet: m[3].trim(), url: m[1] });
+    }
+
+    // Also try: <a rel="nofollow" href="...">title</a><br>snippet<br>
+    if (results.length === 0) {
+      const altRe = /<a[^>]*href="([^"]+)"[^>]*>([^<]+)<\/a><br>([^<]+)/gi;
+      let m2;
+      while ((m2 = altRe.exec(html)) !== null && results.length < 6) {
+        results.push({ title: m2[2].trim(), snippet: m2[3].trim(), url: m2[1] });
+      }
+    }
+
+    log(`DuckDuckGo Lite: ${results.length} results for "${query}"`);
+    return results;
+  } catch (err) {
+    log(`DuckDuckGo Lite failed: ${String(err)}`);
+  }
+
+  return [];
+}
+
+function formatSearchResults(query: string, results: SearchResult[]): string {
+  if (results.length === 0) return `未找到与 "${query}" 相关的结果。`;
+  return results.map((r, i) => {
+    const title = r.title ? `**${r.title}**\n` : "";
+    return `[${i + 1}] ${title}${r.snippet}\n   ${r.url ? `🔗 ${r.url}` : ""}`;
+  }).join("\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// LLM call with function calling
+// ---------------------------------------------------------------------------
+
+const SEARCH_SYSTEM_EXTRA = `\n\n你可以使用 web_search 工具搜索互联网获取实时信息。遇到以下情况请主动搜索：
+- 需要最新数据（新闻、股价、天气等）
+- 时事、近期事件
+- 你知识截止日期之后的信息
+- 用户明确要求搜索或查资料时`;
+
 async function callLLM(
   userId: string,
   userMessage: string,
@@ -682,7 +797,6 @@ async function callLLM(
   });
   const convo = getConversation(userId);
 
-  // "typing..." indicator
   const config = await getConfig({
     baseUrl: account.baseUrl,
     token: account.botToken,
@@ -690,45 +804,85 @@ async function callLLM(
     contextToken: getContextToken(userId),
   });
   if (config.typing_ticket) {
-    sendTyping({
-      baseUrl: account.baseUrl,
-      token: account.botToken,
-      ilinkUserId: userId,
-      typingTicket: config.typing_ticket,
-      status: 1,
-    }).catch(() => {});
+    sendTyping({ baseUrl: account.baseUrl, token: account.botToken, ilinkUserId: userId, typingTicket: config.typing_ticket, status: 1 }).catch(() => {});
   }
 
-  // Build messages with system prompt
+  const systemMsg = SYSTEM_PROMPT + SEARCH_SYSTEM_EXTRA;
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: systemMsg },
     ...convo.map(m => ({ role: m.role as "user" | "assistant", content: m.content })),
     { role: "user", content: userMessage },
   ];
 
   let replyText = "";
+
   try {
-    const stream = await client.chat.completions.create({
+    // Round 1: Try function calling (non-streaming)
+    const resp1 = await client.chat.completions.create({
       model: CLAUDE_MODEL,
       messages,
       max_tokens: 4096,
-      stream: true,
+      tools: [WEB_SEARCH_TOOL],
     });
 
-    for await (const chunk of stream) {
-      const delta = chunk.choices?.[0]?.delta?.content;
-      if (delta) replyText += delta;
+    const choice1 = resp1.choices?.[0];
+    const toolCalls = choice1?.message?.tool_calls;
+
+    if (toolCalls && toolCalls.length > 0) {
+      // Execute searches
+      messages.push(choice1.message);
+      for (const tc of toolCalls) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const tcAny = tc as any;
+        const name = tcAny.function?.name;
+        if (name === "web_search") {
+          const args = JSON.parse(tcAny.function?.arguments || "{}");
+          const query = args.query || userMessage;
+          log(`🔍 搜索: ${query}`);
+          const results = await performSearch(query);
+          const formatted = formatSearchResults(query, results);
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: formatted,
+          });
+        }
+      }
+
+      // Round 2: Get final answer with search results (streaming)
+      const resp2 = await client.chat.completions.create({
+        model: CLAUDE_MODEL,
+        messages,
+        max_tokens: 4096,
+        stream: true,
+      });
+
+      for await (const chunk of resp2) {
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (delta) replyText += delta;
+      }
+    } else {
+      // No tool call — collect content from first response
+      replyText = choice1?.message?.content || "";
+
+      // If the model didn't use tools but the response is empty, fallback to plain completion
+      if (!replyText.trim()) {
+        const fallback = await client.chat.completions.create({
+          model: CLAUDE_MODEL,
+          messages,
+          max_tokens: 4096,
+          stream: true,
+        });
+        for await (const chunk of fallback) {
+          const delta = chunk.choices?.[0]?.delta?.content;
+          if (delta) replyText += delta;
+        }
+      }
     }
 
     // Stop typing
     if (config.typing_ticket) {
-      sendTyping({
-        baseUrl: account.baseUrl,
-        token: account.botToken,
-        ilinkUserId: userId,
-        typingTicket: config.typing_ticket,
-        status: 2,
-      }).catch(() => {});
+      sendTyping({ baseUrl: account.baseUrl, token: account.botToken, ilinkUserId: userId, typingTicket: config.typing_ticket, status: 2 }).catch(() => {});
     }
 
     convo.push({ role: "user", content: userMessage });
@@ -739,13 +893,7 @@ async function callLLM(
 
   } catch (err) {
     if (config.typing_ticket) {
-      sendTyping({
-        baseUrl: account.baseUrl,
-        token: account.botToken,
-        ilinkUserId: userId,
-        typingTicket: config.typing_ticket,
-        status: 2,
-      }).catch(() => {});
+      sendTyping({ baseUrl: account.baseUrl, token: account.botToken, ilinkUserId: userId, typingTicket: config.typing_ticket, status: 2 }).catch(() => {});
     }
     throw err;
   }
