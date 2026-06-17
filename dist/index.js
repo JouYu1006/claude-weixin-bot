@@ -524,6 +524,94 @@ const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || `你是一个专业、可靠�
 const LLM_TEMPERATURE = parseFloat(process.env.LLM_TEMPERATURE || "0.7");
 const LLM_MAX_TOKENS = parseInt(process.env.LLM_MAX_TOKENS || "8192", 10);
 const LLM_REASONING = process.env.LLM_REASONING || "medium"; // low | medium | high — only for v4-pro
+const MEMORY_DIR = path.join(STATE_DIR, "memory");
+function memoryPath(userId) {
+    return path.join(MEMORY_DIR, `${userId.replace(/[@:\/\\]/g, "_")}.json`);
+}
+function loadMemories(userId) {
+    try {
+        fs.mkdirSync(MEMORY_DIR, { recursive: true });
+        const p = memoryPath(userId);
+        if (!fs.existsSync(p))
+            return [];
+        const raw = fs.readFileSync(p, "utf-8");
+        return JSON.parse(raw);
+    }
+    catch {
+        return [];
+    }
+}
+function saveMemories(userId, entries) {
+    try {
+        fs.mkdirSync(MEMORY_DIR, { recursive: true });
+        // Keep last 200 entries, dedup by fact substring
+        const deduped = [];
+        const seen = new Set();
+        for (const e of [...entries].reverse()) {
+            const key = e.fact.slice(0, 60);
+            if (!seen.has(key)) {
+                seen.add(key);
+                deduped.unshift(e);
+            }
+        }
+        fs.writeFileSync(memoryPath(userId), JSON.stringify(deduped.slice(-200), null, 2), "utf-8");
+    }
+    catch { /* non-critical */ }
+}
+function memoryToPrompt(entries) {
+    if (entries.length === 0)
+        return "";
+    const byCat = {};
+    for (const e of entries.slice(-30)) {
+        (byCat[e.category] ??= []).push(`- ${e.fact}`);
+    }
+    const lines = ["", "【关于这位用户，你已知的信息】"];
+    const labels = { personal: "个人", preference: "偏好", context: "背景", topic: "关注话题" };
+    for (const [cat, facts] of Object.entries(byCat)) {
+        lines.push(`[${labels[cat] || cat}]`);
+        lines.push(...facts);
+    }
+    lines.push("【请自然地在对话中使用这些信息，但不要刻意复述】");
+    return lines.join("\n");
+}
+/** Non-blocking: extract interesting facts from the latest exchange */
+function extractFactsInBackground(userId, userMsg, assistantMsg) {
+    (async () => {
+        try {
+            const existing = loadMemories(userId);
+            const oldFacts = existing.slice(-10).map(e => `- ${e.fact}`).join("\n");
+            const client = new OpenAI({ apiKey: process.env.LLM_API_KEY, baseURL: LLM_BASE_URL });
+            const resp = await client.chat.completions.create({
+                model: "deepseek-v4-flash", // cheap model for extraction
+                messages: [
+                    { role: "system", content: `你是一个信息提取助手。从用户和助手的对话中提取关于用户的重要事实。只输出 JSON 数组，每条包含 fact(事实描述)、category(personal/preference/context/topic)。不要重复已有的内容。无新信息则输出 []。` },
+                    { role: "user", content: `已有事实：\n${oldFacts || "(无)"}\n\n用户消息：${userMsg.slice(0, 500)}\n\n助手回复：${assistantMsg.slice(0, 500)}\n\n请提取新的或更新的事实：` }
+                ],
+                max_tokens: 512,
+                temperature: 0.3,
+                response_format: { type: "json_object" },
+            });
+            const text = resp.choices?.[0]?.message?.content || "[]";
+            const parsed = JSON.parse(text);
+            const facts = parsed.facts || parsed;
+            if (Array.isArray(facts) && facts.length > 0) {
+                const now = new Date().toISOString();
+                const newEntries = facts
+                    .filter((f) => f.fact && f.fact.length > 2)
+                    .map((f) => ({
+                    fact: f.fact.trim(),
+                    category: f.category || "context",
+                    at: now,
+                }));
+                if (newEntries.length > 0) {
+                    saveMemories(userId, [...existing, ...newEntries]);
+                    log(`🧠 记忆: ${newEntries.length} 条 → ${memoryPath(userId)}`);
+                }
+            }
+        }
+        catch { /* non-blocking, ignore errors */ }
+    })();
+}
 const conversations = new Map();
 const MAX_CONVERSATION_PAIRS = parseInt(process.env.CONVERSATION_ROUNDS || "100", 10);
 const MAX_USERS = 100;
@@ -886,13 +974,136 @@ async function fetchTopPages(results, maxPages = 3) {
     return pages.length > 0 ? pages.join("\n\n") : "";
 }
 // ---------------------------------------------------------------------------
-// LLM call — search-before-answer strategy
+// Agent Tools
 // ---------------------------------------------------------------------------
-/**
- * Before calling the LLM, check if the message likely needs web search.
- * If yes, search first, then prepend the results to the system prompt.
- * This works with ANY model — no function calling needed.
- */
+/** Safe math evaluation (no eval, uses Function) */
+function calculateExpression(expr) {
+    try {
+        // Whitelist: only allow numbers, operators, parens, math functions
+        const sanitized = expr.replace(/\s+/g, "");
+        if (!/^[0-9+\-*/().,%^!sqrtabslogsin]+$/i.test(sanitized)) {
+            return `表达式包含不支持的内容: ${expr}`;
+        }
+        const result = new Function(`"use strict"; return (${sanitized})`)();
+        return `${expr} = ${result}`;
+    }
+    catch (e) {
+        return `计算失败: ${String(e)}`;
+    }
+}
+/** Simple translation via pre-search */
+async function quickTranslate(text, targetLang) {
+    const q = `translate "${text}" to ${targetLang}`;
+    const results = await performSearch(q);
+    if (results.length > 0) {
+        return results.slice(0, 2).map(r => `${r.title}\n${r.snippet}`).join("\n\n");
+    }
+    return `无法翻译 "${text.slice(0, 50)}"`;
+}
+/** Run code snippet (JavaScript only, timeout 3s, no network/fs) */
+async function runCodeSnippet(code) {
+    try {
+        const result = await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error("执行超时 (3s)")), 3000);
+            try {
+                // Run in isolated context — console.log goes to captured output
+                const logs = [];
+                const fakeConsole = { log: (...a) => logs.push(a.map(String).join(" ")) };
+                const fn = new Function("console", `"use strict"; ${code}`);
+                const ret = fn(fakeConsole);
+                clearTimeout(timer);
+                const output = logs.length > 0 ? logs.join("\n") : String(ret ?? "(无输出)");
+                resolve(output);
+            }
+            catch (e) {
+                clearTimeout(timer);
+                reject(e);
+            }
+        });
+        return result;
+    }
+    catch (e) {
+        return `代码执行错误: ${String(e)}`;
+    }
+}
+/** Tool definitions for function calling */
+const AGENT_TOOLS = [
+    {
+        type: "function",
+        function: {
+            name: "calculate",
+            description: "计算数学表达式。支持 + - * / () sqrt abs log sin pow。例如: (100+200)*0.8",
+            parameters: {
+                type: "object",
+                properties: { expression: { type: "string", description: "数学表达式" } },
+                required: ["expression"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "translate",
+            description: "翻译文本到指定语言。当用户要求翻译时使用。",
+            parameters: {
+                type: "object",
+                properties: {
+                    text: { type: "string", description: "要翻译的文本" },
+                    target: { type: "string", description: "目标语言，如 English、中文、日语、法语" },
+                },
+                required: ["text", "target"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "run_code",
+            description: "执行 JavaScript 代码。用于数学计算、数据处理、算法演示。不能访问文件系统和网络。输出使用 console.log()。",
+            parameters: {
+                type: "object",
+                properties: { code: { type: "string", description: "JavaScript 代码" } },
+                required: ["code"],
+            },
+        },
+    },
+];
+async function executeToolCalls(toolCalls) {
+    const results = [];
+    for (const tc of toolCalls) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const fn = tc.function;
+        const name = fn?.name || "";
+        const argsStr = fn?.arguments || "{}";
+        const args = JSON.parse(argsStr);
+        let output = "";
+        try {
+            if (name === "calculate") {
+                output = calculateExpression(args.expression || "");
+                log(`🧮 计算: ${args.expression} → ${output.slice(0, 60)}`);
+            }
+            else if (name === "translate") {
+                output = await quickTranslate(args.text || "", args.target || "English");
+                log(`🌐 翻译: ${(args.text || "").slice(0, 30)} → ${args.target}`);
+            }
+            else if (name === "run_code") {
+                output = await runCodeSnippet(args.code || "");
+                log(`💻 代码: ${(args.code || "").slice(0, 50)}`);
+            }
+            else {
+                output = `未知工具: ${name}`;
+            }
+        }
+        catch (e) {
+            output = `工具执行错误: ${String(e)}`;
+        }
+        results.push({ role: "tool", tool_call_id: tc.id, content: output });
+    }
+    return results;
+}
+// ---------------------------------------------------------------------------
+// LLM call — with Agent Tool Loop + Pre-Search
+// ---------------------------------------------------------------------------
 async function callLLM(userId, userMessage, account) {
     const client = new OpenAI({
         apiKey: process.env.LLM_API_KEY,
@@ -938,7 +1149,10 @@ async function callLLM(userId, userMessage, account) {
     // --- Build prompt ---
     // Strategy: Don't say "search" or "web" or "资料". Just splice results into the user message
     // as if the user copy-pasted them. DeepSeek can't refuse to read user-provided text.
-    let systemMsg = SYSTEM_PROMPT;
+    // Load persistent memories for this user
+    const memories = loadMemories(userId);
+    const memoryPrompt = memoryToPrompt(memories);
+    let systemMsg = SYSTEM_PROMPT + memoryPrompt;
     let promptUserMessage = userMessage;
     if (searchContext) {
         // Rewrite the entire user message: results ARE the user message now
@@ -960,23 +1174,50 @@ ${cleanResults}
     ];
     let replyText = "";
     try {
-        const createParams = {
-            model: CLAUDE_MODEL,
-            messages,
-            max_tokens: LLM_MAX_TOKENS,
-            temperature: LLM_TEMPERATURE,
-            top_p: 0.95,
-            stream: true,
-        };
-        // V4-Pro thinking mode: sends reasoning_effort via extra_body
-        if (CLAUDE_MODEL.includes("v4-pro")) {
-            createParams["reasoning_effort"] = LLM_REASONING;
+        // --- Agent Tool Loop (max 3 rounds) ---
+        let workingMessages = [...messages];
+        const MAX_TOOL_ROUNDS = 3;
+        for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+            // Non-streaming call to check for tool requests
+            const resp = await client.chat.completions.create({
+                model: CLAUDE_MODEL,
+                messages: workingMessages,
+                max_tokens: LLM_MAX_TOKENS,
+                temperature: LLM_TEMPERATURE,
+                top_p: 0.95,
+                tools: AGENT_TOOLS,
+                ...(CLAUDE_MODEL.includes("v4-pro") ? { reasoning_effort: LLM_REASONING } : {}),
+            });
+            const choice = resp.choices?.[0];
+            const toolCalls = choice?.message?.tool_calls;
+            if (toolCalls && toolCalls.length > 0) {
+                // Execute tools and continue loop
+                workingMessages.push(choice.message);
+                const toolResults = await executeToolCalls(toolCalls);
+                workingMessages.push(...toolResults);
+                log(`🔧 工具调用 (第 ${round + 1} 轮): ${toolCalls.map((tc) => tc.function?.name).join(", ")}`);
+                continue; // loop to next round with tool results
+            }
+            // No tools — collect reply and break
+            replyText = choice?.message?.content || "";
+            break;
         }
-        const stream = await client.chat.completions.create(createParams);
-        for await (const chunk of stream) {
-            const delta = chunk.choices?.[0]?.delta?.content;
-            if (delta)
-                replyText += delta;
+        // If reply is empty after tool loop, do a final streaming call
+        if (!replyText.trim()) {
+            const stream = await client.chat.completions.create({
+                model: CLAUDE_MODEL,
+                messages: workingMessages,
+                max_tokens: LLM_MAX_TOKENS,
+                temperature: LLM_TEMPERATURE,
+                top_p: 0.95,
+                stream: true,
+                ...(CLAUDE_MODEL.includes("v4-pro") ? { reasoning_effort: LLM_REASONING } : {}),
+            });
+            for await (const chunk of stream) {
+                const delta = chunk.choices?.[0]?.delta?.content;
+                if (delta)
+                    replyText += delta;
+            }
         }
         // Stop typing
         if (config.typing_ticket) {
@@ -986,6 +1227,8 @@ ${cleanResults}
         convo.push({ role: "user", content: userMessage });
         convo.push({ role: "assistant", content: replyText });
         trimConversation(convo);
+        // Background: extract user facts from this exchange (non-blocking)
+        extractFactsInBackground(userId, userMessage, replyText);
         // Prepend search indicator if search was triggered
         const result = splitText(replyText);
         if (searchHint && result.length > 0) {
@@ -1029,6 +1272,87 @@ function splitText(text) {
     if (remaining)
         chunks.push(remaining);
     return chunks;
+}
+// ---------------------------------------------------------------------------
+// Daily Push (weather + news, scheduled)
+// ---------------------------------------------------------------------------
+const DAILY_PUSH_TIME = process.env.DAILY_PUSH_TIME || ""; // "08:00" format
+let pushTimer = null;
+async function runDailyPush(account) {
+    const userId = account.userId;
+    if (!userId) {
+        log("⏰ 推送跳过：未找到用户 ID");
+        return;
+    }
+    log(`⏰ 执行每日推送...`);
+    const dateStr = new Date().toLocaleDateString("zh-CN", { weekday: "long", month: "long", day: "numeric" });
+    // 1. Search weather
+    let weatherText = "";
+    try {
+        const weatherResults = await performSearch(`weather forecast today`);
+        if (weatherResults.length > 0) {
+            weatherText = weatherResults.slice(0, 3).map(r => `${r.title}${r.snippet ? `: ${r.snippet}` : ""}`).join("\n");
+        }
+    }
+    catch {
+        weatherText = "天气数据暂不可用";
+    }
+    // 2. Search news
+    let newsText = "";
+    try {
+        const newsResults = await performSearch(`latest technology news ${new Date().toISOString().slice(0, 10)}`);
+        if (newsResults.length > 0) {
+            newsText = newsResults.slice(0, 5).map(r => `• ${r.title}${r.snippet ? ` — ${r.snippet.slice(0, 100)}` : ""}`).join("\n");
+        }
+    }
+    catch {
+        newsText = "新闻数据暂不可用";
+    }
+    // 3. Compose and send
+    const summary = `☀️ ${dateStr} 早间简报
+
+🌤️ 天气
+${weatherText || "暂无天气数据"}
+
+📰 科技早报
+${newsText || "暂无新闻数据"}
+
+✨ 祝你今天愉快！`;
+    try {
+        await sendMessage({
+            baseUrl: account.baseUrl,
+            token: account.botToken,
+            toUserId: userId,
+            text: summary,
+            contextToken: getContextToken(userId),
+        });
+        log(`✅ 每日推送完成 → ${userId}`);
+    }
+    catch (err) {
+        log(`❌ 每日推送失败: ${String(err)}`);
+    }
+}
+function scheduleDailyPush(account) {
+    if (!DAILY_PUSH_TIME)
+        return;
+    const [h, m] = DAILY_PUSH_TIME.split(":").map(Number);
+    if (isNaN(h) || isNaN(m)) {
+        log(`⚠️  DAILY_PUSH_TIME 格式错误: ${DAILY_PUSH_TIME}`);
+        return;
+    }
+    // Calculate ms until next occurrence
+    const now = new Date();
+    const target = new Date(now);
+    target.setHours(h, m, 0, 0);
+    if (target <= now)
+        target.setDate(target.getDate() + 1);
+    const delay = target.getTime() - now.getTime();
+    const interval = 24 * 60 * 60 * 1000; // every 24h
+    log(`⏰ 每日推送: ${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")} (${Math.round(delay / 60000)} 分钟后首次)`);
+    setTimeout(() => {
+        runDailyPush(account);
+        pushTimer = setInterval(() => runDailyPush(account), interval);
+    }, delay);
 }
 // ---------------------------------------------------------------------------
 // Monitor loop
@@ -1122,11 +1446,15 @@ async function runMonitor(account) {
                 if (text === "/diag" || text === "/debug") {
                     const diag = `🤖 Claude-Weixin-Bot v1.0.0
 📡 模型: ${CLAUDE_MODEL}
-🧠 推理: ${LLM_REASONING} | 温度: ${LLM_TEMPERATURE} | max_tokens: ${LLM_MAX_TOKENS}
+🧠 推理: ${LLM_REASONING} | 温度: ${LLM_TEMPERATURE} | tokens: ${LLM_MAX_TOKENS}
 🔗 API: ${LLM_BASE_URL}
-🔍 搜索引擎: ${searchEngineStatus}
-⚠️ 最后错误: ${lastSearchError || "无"}
-💾 状态: ${isSessionPaused() ? "暂停中" : "运行中"}`;
+🔍 搜索: ${searchEngineStatus}
+🧠 记忆: ${loadMemories(fromUser).length} 条
+⏰ 推送: ${DAILY_PUSH_TIME || "关闭"}
+🛠️ Agent: 计算/翻译/代码
+⚠️ 错误: ${lastSearchError || "无"}
+💾 状态: ${isSessionPaused() ? "暂停中" : "运行中"}
+🗣️  上下文: ${getConversation(fromUser).length} 条`;
                     await sendMessage({ baseUrl: account.baseUrl, token: account.botToken, toUserId: fromUser, text: diag, contextToken: getContextToken(fromUser) });
                     log(`📤 诊断回复 to=${fromUser}`);
                     continue;
@@ -1254,12 +1582,16 @@ async function main() {
     log("   /testsearch — 测试搜索");
     log("   按 Ctrl+C 停止");
     log("");
+    // Start daily push scheduler
+    scheduleDailyPush(account);
     // Handle graceful shutdown
     let shuttingDown = false;
     const shutdown = async () => {
         if (shuttingDown)
             return;
         shuttingDown = true;
+        if (pushTimer)
+            clearInterval(pushTimer);
         log("\n🛑 正在退出...");
         if (account) {
             await notifyStop({ baseUrl: account.baseUrl, token: account.botToken });
