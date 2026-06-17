@@ -642,6 +642,21 @@ interface ImageDownloadInfo {
   aesKey: Buffer; // 16 bytes
 }
 
+/** Parse AES key — supports base64(raw bytes) and base64(hex string) */
+function parseAesKey(src: string): Buffer {
+  const decoded = Buffer.from(src, "base64");
+  if (decoded.length === 16) return decoded;
+  // Double-encoded: base64 → hex string → bytes
+  if (decoded.length === 32 && /^[0-9a-fA-F]{32}$/.test(decoded.toString("ascii"))) {
+    return Buffer.from(decoded.toString("ascii"), "hex");
+  }
+  // Try raw hex
+  if (src.length === 32 && /^[0-9a-fA-F]{32}$/.test(src)) {
+    return Buffer.from(src, "hex");
+  }
+  return decoded.subarray(0, 16); // best-effort
+}
+
 /** Extract CDN download info from an image message */
 function extractImageInfo(msg: WeixinMessage): ImageDownloadInfo | null {
   const items = msg.item_list ?? [];
@@ -652,16 +667,26 @@ function extractImageInfo(msg: WeixinMessage): ImageDownloadInfo | null {
       const fullUrl = media["full_url"] as string | undefined;
       const encryptParam = media["encrypt_query_param"] as string | undefined;
       const mediaAesKey = media["aes_key"] as string | undefined;
-      const rawAesKey = img["aeskey"] as string | undefined;
+      const rawAesKey = img["aeskey"] as string | undefined; // 32 hex chars
 
-      if ((fullUrl || encryptParam) && (rawAesKey || mediaAesKey)) {
+      const cdnBase = "https://novac2c.cdn.weixin.qq.com/c2c";
+
+      if (fullUrl || encryptParam) {
         let key: Buffer;
-        if (rawAesKey) {
-          key = Buffer.from(rawAesKey, "hex");
-        } else {
-          key = Buffer.from(mediaAesKey!, "base64");
-        }
-        const downloadUrl = fullUrl || `https://novac2c.cdn.weixin.qq.com/c2c/download?${encryptParam}`;
+        try {
+          if (rawAesKey) {
+            key = Buffer.from(rawAesKey, "hex");
+          } else if (mediaAesKey) {
+            key = parseAesKey(mediaAesKey);
+          } else {
+            continue;
+          }
+        } catch { continue; }
+
+        // Prefer server-provided full URL; fallback to client-built
+        const downloadUrl = fullUrl
+          || `${cdnBase}/download?encrypted_query_param=${encodeURIComponent(encryptParam!)}`;
+
         return { downloadUrl, aesKey: key };
       }
     }
@@ -672,49 +697,89 @@ function extractImageInfo(msg: WeixinMessage): ImageDownloadInfo | null {
 /** Download and decrypt an image from WeChat CDN (AES-128-ECB) */
 async function downloadWeChatImage(info: ImageDownloadInfo): Promise<Buffer | null> {
   try {
-    log(`📥 下载图片: ${info.downloadUrl.slice(0, 80)}...`);
+    log(`📥 下载: ${info.downloadUrl.slice(0, 100)}...`);
     const resp = await fetch(info.downloadUrl, {
       signal: AbortSignal.timeout(15000),
       headers: { "User-Agent": "Mozilla/5.0 (compatible; ClaudeWeixinBot/1.0)" },
     });
-    if (!resp.ok) { log(`❌ 图片下载失败: ${resp.status}`); return null; }
+    if (!resp.ok) {
+      const errBody = await resp.text().catch(() => "");
+      log(`❌ CDN下载失败: ${resp.status} ${errBody.slice(0, 100)}`);
+      return null;
+    }
     const encrypted = Buffer.from(await resp.arrayBuffer());
+    log(`📥 CDN: ${encrypted.length} bytes encrypted`);
 
-    // AES-128-ECB decrypt
     const decipher = crypto.createDecipheriv("aes-128-ecb", info.aesKey, null);
     const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-    log(`✅ 图片解密完成: ${encrypted.length} → ${decrypted.length} bytes`);
+    log(`✅ 解密: ${decrypted.length} bytes`);
     return decrypted;
   } catch (err) {
-    log(`❌ 图片处理失败: ${String(err)}`);
+    log(`❌ 下载解密失败: ${String(err)}`);
     return null;
   }
 }
 
-/** Send image to vision model for recognition */
+/** Send image to vision model — DeepSeek first, fallback to Groq (free) */
 async function recognizeImage(
   imageBuffer: Buffer,
   userPrompt: string,
 ): Promise<string> {
-  const client = new OpenAI({ apiKey: process.env.LLM_API_KEY, baseURL: LLM_BASE_URL });
   const base64 = imageBuffer.toString("base64");
-  const mimeType = "image/jpeg"; // WeChat images are JPEG
+  const mimeType = "image/jpeg";
 
-  const resp = await client.chat.completions.create({
-    model: CLAUDE_MODEL.includes("v4") ? CLAUDE_MODEL : "deepseek-v4-flash",
-    messages: [{
-      role: "user",
-      content: [
-        { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64}` } },
-        { type: "text", text: userPrompt || "请描述这张图片的内容，包括里面的文字、物品、场景。" },
-      ],
-    }],
-    max_tokens: 2048,
-    temperature: 0.3,
-    stream: false,
-  });
+  // Try 1: DeepSeek V4 vision API
+  try {
+    const client = new OpenAI({ apiKey: process.env.LLM_API_KEY, baseURL: LLM_BASE_URL });
+    const resp = await client.chat.completions.create({
+      model: CLAUDE_MODEL.includes("v4") ? CLAUDE_MODEL : "deepseek-v4-flash",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64}` } },
+          { type: "text", text: userPrompt || "请描述这张图片的内容，包括里面的文字、物品、场景。" },
+        ],
+      }] as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming["messages"],
+      max_tokens: 2048,
+      temperature: 0.3,
+      stream: false,
+    });
+    const text = resp.choices?.[0]?.message?.content || "";
+    if (text.trim()) { log(`✅ DeepSeek vision: ${text.slice(0, 80)}...`); return text; }
+    log(`⚠️ DeepSeek vision returned empty`);
+  } catch (err) {
+    log(`⚠️ DeepSeek vision failed: ${String(err).slice(0, 100)}`);
+  }
 
-  return resp.choices?.[0]?.message?.content || "";
+  // Try 2: Groq (free Llama 4 vision — no API key needed? actually needs key but is cheap)
+  const groqKey = process.env.GROQ_API_KEY;
+  if (groqKey) {
+    try {
+      log(`🔄 Groq 视觉 fallback...`);
+      const groq = new OpenAI({ apiKey: groqKey, baseURL: "https://api.groq.com/openai/v1" });
+      const resp = await groq.chat.completions.create({
+        model: "llama-4-scout-17b-16e-instruct",
+        messages: [{
+          role: "user",
+          content: [
+            { type: "image_url" as const, image_url: { url: `data:${mimeType};base64,${base64}` } },
+            { type: "text" as const, text: userPrompt || "Please describe this image in Chinese. Identify text, objects, and scene." },
+          ],
+        }],
+        max_tokens: 2048,
+        temperature: 0.3,
+        stream: false,
+      });
+      const text = resp.choices?.[0]?.message?.content || "";
+      if (text.trim()) { log(`✅ Groq: ${text.slice(0, 80)}...`); return text; }
+    } catch (err) {
+      log(`⚠️ Groq fallback failed: ${String(err).slice(0, 80)}`);
+    }
+  } else {
+    log(`ℹ️ 未设置 GROQ_API_KEY，跳过 Groq 视觉 fallback`);
+  }
+
+  return "抱歉，DeepSeek 视觉 API 暂不可用。你可以设置 GROQ_API_KEY 环境变量启用免费的 Llama 4 视觉识别。";
 }
 
 /** Handle image message: download, decrypt, recognize, reply */
