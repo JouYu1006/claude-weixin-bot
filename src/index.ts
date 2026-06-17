@@ -637,6 +637,122 @@ function getMediaType(msg: WeixinMessage): string | undefined {
   return undefined;
 }
 
+interface ImageDownloadInfo {
+  downloadUrl: string;
+  aesKey: Buffer; // 16 bytes
+}
+
+/** Extract CDN download info from an image message */
+function extractImageInfo(msg: WeixinMessage): ImageDownloadInfo | null {
+  const items = msg.item_list ?? [];
+  for (const item of items) {
+    if (item.type === 2 && item.image_item) {
+      const img = item.image_item as Record<string, unknown>;
+      const media = (img["media"] || {}) as Record<string, unknown>;
+      const fullUrl = media["full_url"] as string | undefined;
+      const encryptParam = media["encrypt_query_param"] as string | undefined;
+      const mediaAesKey = media["aes_key"] as string | undefined;
+      const rawAesKey = img["aeskey"] as string | undefined;
+
+      if ((fullUrl || encryptParam) && (rawAesKey || mediaAesKey)) {
+        let key: Buffer;
+        if (rawAesKey) {
+          key = Buffer.from(rawAesKey, "hex");
+        } else {
+          key = Buffer.from(mediaAesKey!, "base64");
+        }
+        const downloadUrl = fullUrl || `https://novac2c.cdn.weixin.qq.com/c2c/download?${encryptParam}`;
+        return { downloadUrl, aesKey: key };
+      }
+    }
+  }
+  return null;
+}
+
+/** Download and decrypt an image from WeChat CDN (AES-128-ECB) */
+async function downloadWeChatImage(info: ImageDownloadInfo): Promise<Buffer | null> {
+  try {
+    log(`📥 下载图片: ${info.downloadUrl.slice(0, 80)}...`);
+    const resp = await fetch(info.downloadUrl, {
+      signal: AbortSignal.timeout(15000),
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; ClaudeWeixinBot/1.0)" },
+    });
+    if (!resp.ok) { log(`❌ 图片下载失败: ${resp.status}`); return null; }
+    const encrypted = Buffer.from(await resp.arrayBuffer());
+
+    // AES-128-ECB decrypt
+    const decipher = crypto.createDecipheriv("aes-128-ecb", info.aesKey, null);
+    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    log(`✅ 图片解密完成: ${encrypted.length} → ${decrypted.length} bytes`);
+    return decrypted;
+  } catch (err) {
+    log(`❌ 图片处理失败: ${String(err)}`);
+    return null;
+  }
+}
+
+/** Send image to vision model for recognition */
+async function recognizeImage(
+  imageBuffer: Buffer,
+  userPrompt: string,
+): Promise<string> {
+  const client = new OpenAI({ apiKey: process.env.LLM_API_KEY, baseURL: LLM_BASE_URL });
+  const base64 = imageBuffer.toString("base64");
+  const mimeType = "image/jpeg"; // WeChat images are JPEG
+
+  const resp = await client.chat.completions.create({
+    model: CLAUDE_MODEL.includes("v4") ? CLAUDE_MODEL : "deepseek-v4-flash",
+    messages: [{
+      role: "user",
+      content: [
+        { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64}` } },
+        { type: "text", text: userPrompt || "请描述这张图片的内容，包括里面的文字、物品、场景。" },
+      ],
+    }],
+    max_tokens: 2048,
+    temperature: 0.3,
+    stream: false,
+  });
+
+  return resp.choices?.[0]?.message?.content || "";
+}
+
+/** Handle image message: download, decrypt, recognize, reply */
+async function handleImageMessage(
+  msg: WeixinMessage,
+  fromUser: string,
+  account: AccountData,
+): Promise<string> {
+  const info = extractImageInfo(msg);
+  if (!info) return "抱歉，我无法读取这张图片的数据。";
+
+  await sendTyping({
+    baseUrl: account.baseUrl,
+    token: account.botToken,
+    ilinkUserId: fromUser,
+    typingTicket: "",
+    status: 1,
+  }).catch(() => {});
+
+  const imageBuffer = await downloadWeChatImage(info);
+  if (!imageBuffer) return "抱歉，图片下载或解密失败。";
+
+  const text = extractText(msg);
+  const prompt = text || "请详细描述这张图片的内容。如果图片中有文字，请识别并翻译。";
+
+  const recognition = await recognizeImage(imageBuffer, prompt);
+
+  await sendTyping({
+    baseUrl: account.baseUrl,
+    token: account.botToken,
+    ilinkUserId: fromUser,
+    typingTicket: "",
+    status: 2,
+  }).catch(() => {});
+
+  return recognition || "抱歉，我无法识别这张图片的内容。";
+}
+
 // ---------------------------------------------------------------------------
 // Claude integration
 // ---------------------------------------------------------------------------
@@ -1648,15 +1764,38 @@ async function runMonitor(account: AccountData): Promise<void> {
           continue;
         }
 
-        // Build prompt with media awareness
+        // --- Handle media types ---
         let prompt = text;
-        if (mediaType && !text) {
-          prompt = `[用户发送了一个${mediaType === "image" ? "图片" : mediaType === "voice" ? "语音" : mediaType === "file" ? "文件" : "视频"}，但我无法直接查看其内容]`;
-        } else if (mediaType && text) {
-          prompt = `[用户发送了一段消息并附带了一个${mediaType === "image" ? "图片" : mediaType === "voice" ? "语音" : mediaType === "file" ? "文件" : "视频"}]\n${text}`;
+
+        // Image recognition
+        if (mediaType === "image") {
+          log(`🖼️  图片消息 — 下载解密识别...`);
+          try {
+            const recognition = await handleImageMessage(msg, fromUser, account);
+            if (recognition) {
+              await sendMessage({
+                baseUrl: account.baseUrl, token: account.botToken, toUserId: fromUser,
+                text: recognition, contextToken: getContextToken(fromUser),
+              });
+              log(`📤 图片识别回复: ${recognition.slice(0, 80)}...`);
+            }
+          } catch (err) {
+            log(`❌ 图片识别失败: ${String(err)}`);
+            await sendMessage({
+              baseUrl: account.baseUrl, token: account.botToken, toUserId: fromUser,
+              text: "抱歉，图片识别失败，请稍后再试。", contextToken: getContextToken(fromUser),
+            });
+          }
+          continue; // handled, skip LLM call
         }
 
-        // Call Claude and reply
+        if (mediaType && !text) {
+          prompt = `[用户发送了一个${mediaType === "voice" ? "语音" : mediaType === "file" ? "文件" : "视频"}，但我暂不支持直接查看]`;
+        } else if (mediaType && text) {
+          prompt = `[用户发送了一段消息并附带了一个${mediaType === "voice" ? "语音" : mediaType === "file" ? "文件" : "视频"}]\n${text}`;
+        }
+
+        // Call LLM and reply
         try {
           const chunks = await callLLM(fromUser, prompt, account);
           for (const chunk of chunks) {
