@@ -512,7 +512,18 @@ function getMediaType(msg) {
 // ---------------------------------------------------------------------------
 const CLAUDE_MODEL = process.env.LLM_MODEL || "deepseek-chat";
 const LLM_BASE_URL = process.env.LLM_BASE_URL || "https://api.deepseek.com/v1";
-const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "你是一个微信 AI 助手。请用简洁、友好的中文回复。回答要有条理，避免冗长。";
+const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || `你是一个专业、可靠的智能助手，通过微信与用户交流。请遵循以下原则：
+
+1. **深度理解**：仔细分析用户问题的核心意图，不要浮于表面。
+2. **精准回答**：提供具体、有依据的答案。引用数据、事实、来源。避免空洞的套话。
+3. **结构化表达**：使用清晰的段落、编号或符号组织信息，让答案一目了然。
+4. **主动延伸**：如果用户的问题可能需要进一步的信息，主动补充相关背景或建议。
+5. **简洁有力**：在保证信息完整的前提下，尽量精简。微信消息不宜过长。
+6. **中文优先**：始终用中文回答，专业术语可附英文原文。
+7. **诚实边界**：如果你不确定某事，明确告知并给出获取信息的建议，而不是编造。`;
+const LLM_TEMPERATURE = parseFloat(process.env.LLM_TEMPERATURE || "0.7");
+const LLM_MAX_TOKENS = parseInt(process.env.LLM_MAX_TOKENS || "8192", 10);
+const LLM_REASONING = process.env.LLM_REASONING || "medium"; // low | medium | high — only for v4-pro
 const conversations = new Map();
 const MAX_CONVERSATION_PAIRS = 20; // 20 round-trips = 40 messages
 const MAX_USERS = 100;
@@ -949,12 +960,19 @@ ${cleanResults}
     ];
     let replyText = "";
     try {
-        const stream = await client.chat.completions.create({
+        const createParams = {
             model: CLAUDE_MODEL,
             messages,
-            max_tokens: 4096,
+            max_tokens: LLM_MAX_TOKENS,
+            temperature: LLM_TEMPERATURE,
+            top_p: 0.95,
             stream: true,
-        });
+        };
+        // V4-Pro thinking mode: sends reasoning_effort via extra_body
+        if (CLAUDE_MODEL.includes("v4-pro")) {
+            createParams["reasoning_effort"] = LLM_REASONING;
+        }
+        const stream = await client.chat.completions.create(createParams);
         for await (const chunk of stream) {
             const delta = chunk.choices?.[0]?.delta?.content;
             if (delta)
@@ -1104,6 +1122,7 @@ async function runMonitor(account) {
                 if (text === "/diag" || text === "/debug") {
                     const diag = `🤖 Claude-Weixin-Bot v1.0.0
 📡 模型: ${CLAUDE_MODEL}
+🧠 推理: ${LLM_REASONING} | 温度: ${LLM_TEMPERATURE} | max_tokens: ${LLM_MAX_TOKENS}
 🔗 API: ${LLM_BASE_URL}
 🔍 搜索引擎: ${searchEngineStatus}
 ⚠️ 最后错误: ${lastSearchError || "无"}
@@ -1200,6 +1219,7 @@ async function main() {
         process.exit(1);
     }
     log(`🤖 模型: ${CLAUDE_MODEL}`);
+    log(`🧠 推理深度: ${LLM_REASONING} | 温度: ${LLM_TEMPERATURE} | max_tokens: ${LLM_MAX_TOKENS}`);
     log(`🔗 API: ${LLM_BASE_URL}`);
     log(`💾 状态目录: ${STATE_DIR}`);
     // Load or create account
