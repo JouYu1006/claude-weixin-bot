@@ -705,73 +705,95 @@ function shouldSearch(text: string): string | null {
 }
 
 /**
- * Reliable search that works from Railway (US servers).
- * Uses DuckDuckGo HTML endpoint with stable structure.
+ * Search engine status (set by startup self-test, visible via /diag)
+ */
+let searchEngineStatus = "未检测";
+let lastSearchError = "";
+
+/**
+ * Reliable search: DDG JSON API (free, no key, works from US datacenters).
  */
 async function performSearch(query: string): Promise<SearchResult[]> {
-  const slog = (msg: string) => log(`[search] ${msg}`);
-  const ua = "Mozilla/5.0 (compatible; ClaudeWeixinBot/1.0)";
+  const slog = (msg: string) => { log(`[search] ${msg}`); };
+  let anyEngineReachable = false;
+  let status = "";
 
-  // Engine 1: DuckDuckGo HTML (most reliable, stable structure)
+  // Engine 1: DuckDuckGo JSON API (proper API, not HTML scraping)
+  try {
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+    slog(`DDG JSON...`);
+    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const data = await resp.json() as Record<string, unknown>;
+    anyEngineReachable = true;
+    const results: SearchResult[] = [];
+
+    const abs = (data.AbstractText as string)?.trim();
+    if (abs) results.push({ title: (data.Heading as string) || query, snippet: abs, url: (data.AbstractURL as string) || `https://duckduckgo.com/?q=${encodeURIComponent(query)}` });
+
+    const related = data.RelatedTopics as Array<{ Text?: string; FirstURL?: string }> | undefined;
+    if (related) for (const r of related) { if (r.Text && results.length < 6) results.push({ title: "", snippet: r.Text.replace(/<[^>]+>/g, ""), url: r.FirstURL || "" }); }
+
+    slog(`DDG JSON: ${resp.status}, abstract=${abs ? "yes" : "no"}, related=${related?.length || 0}, results=${results.length}`);
+    status = "DDG JSON OK";
+    if (results.length > 0) { searchEngineStatus = status; lastSearchError = ""; return results; }
+  } catch (err) { slog(`DDG JSON err: ${String(err)}`); }
+
+  // Engine 2: DDG HTML
   try {
     const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    slog(`trying DDG HTML...`);
-    const resp = await fetch(url, {
-      signal: AbortSignal.timeout(12000),
-      headers: { "User-Agent": ua, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" },
-    });
+    slog(`DDG HTML...`);
+    const resp = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { "User-Agent": "Mozilla/5.0 (compatible; ClaudeWeixinBot/1.0)" } });
+    anyEngineReachable = true;
     const html = await resp.text();
-    slog(`DDG HTML response: ${html.length} bytes`);
-
     const results: SearchResult[] = [];
-    // DDG HTML results: <a rel="nofollow" class="result__a" href="...">title</a>
-    // followed by <a class="result__snippet">snippet</a>
-    const blockRe = /class="result__body"[^>]*>([\s\S]*?)<\/td>/gi;
-    let b;
-    while ((b = blockRe.exec(html)) !== null && results.length < 6) {
+    const re = /class="result__body"[^>]*>([\s\S]*?)<\/td>/gi;
+    let b; while ((b = re.exec(html)) !== null && results.length < 6) {
       const body = b[1];
       const tm = /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
       const sm = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
-      if (tm) {
-        const title = tm[2].replace(/<[^>]+>/g, "").trim();
-        const url = tm[1].startsWith("//") ? `https:${tm[1]}` : tm[1];
-        if (title) results.push({ title, snippet: sm?.[1]?.replace(/<[^>]+>/g, "").trim() || "", url });
-      }
+      if (tm) { const t = tm[2].replace(/<[^>]+>/g, "").trim(); if (t) results.push({ title: t, snippet: sm?.[1]?.replace(/<[^>]+>/g, "").trim() || "", url: tm[1].startsWith("//") ? `https:${tm[1]}` : tm[1] }); }
     }
-    if (results.length > 0) { slog(`DDG HTML: ${results.length} results`); return results; }
+    slog(`DDG HTML: ${resp.status}, ${results.length} results`);
+    status = "DDG HTML OK";
+    if (results.length > 0) { searchEngineStatus = status; lastSearchError = ""; return results; }
   } catch (err) { slog(`DDG HTML err: ${String(err)}`); }
 
-  // Engine 2: Bing (works from US)
+  // Engine 3: Bing
   try {
     const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10`;
-    slog(`trying Bing...`);
-    const resp = await fetch(url, {
-      signal: AbortSignal.timeout(10000),
-      headers: { "User-Agent": ua, "Accept-Language": "zh-CN" },
-    });
+    slog(`Bing...`);
+    const resp = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { "User-Agent": "Mozilla/5.0 (compatible; ClaudeWeixinBot/1.0)" } });
+    anyEngineReachable = true;
     const html = await resp.text();
-    slog(`Bing response: ${html.length} bytes, status: ${resp.status}`);
-
     const results: SearchResult[] = [];
-    const re = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/gi;
-    let b;
-    while ((b = re.exec(html)) !== null && results.length < 6) {
-      const body = b[1];
+    const re2 = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/gi;
+    let b2; while ((b2 = re2.exec(html)) !== null && results.length < 6) {
+      const body = b2[1];
       const tm = /<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
       const sm = /<(?:p|div)[^>]*>([\s\S]{15,300}?)<\/(?:p|div)>/i.exec(body);
-      if (tm) {
-        const title = tm[2].replace(/<[^>]+>/g, "").trim();
-        const url = tm[1].startsWith("http") ? tm[1] : `https://www.bing.com${tm[1]}`;
-        if (title && title.length > 2) {
-          results.push({ title, snippet: sm?.[1]?.replace(/<[^>]+>/g, "").trim() || "", url });
-        }
-      }
+      if (tm) { const t = tm[2].replace(/<[^>]+>/g, "").trim(); if (t && t.length > 2) results.push({ title: t, snippet: sm?.[1]?.replace(/<[^>]+>/g, "").trim() || "", url: tm[1].startsWith("http") ? tm[1] : `https://www.bing.com${tm[1]}` }); }
     }
-    if (results.length > 0) { slog(`Bing: ${results.length} results`); return results; }
+    slog(`Bing: ${resp.status}, ${results.length} results`);
+    status = "Bing OK";
+    if (results.length > 0) { searchEngineStatus = status; lastSearchError = ""; return results; }
   } catch (err) { slog(`Bing err: ${String(err)}`); }
 
-  slog(`ALL engines failed for "${query}"`);
+  searchEngineStatus = anyEngineReachable ? `${status} (空结果)` : "ALL DEAD";
+  lastSearchError = anyEngineReachable ? "" : "全部搜索引擎无法连接";
+  if (!anyEngineReachable) slog(`ALL engines unreachable`);
   return [];
+}
+
+/** Startup self-test: try a simple search and report */
+async function testSearch(): Promise<string> {
+  log(`🧪 搜索引擎自检...`);
+  const results = await performSearch("hello world");
+  if (results.length > 0) {
+    log(`✅ 搜索正常 (${results.length} 条)`);
+    return `✅ 搜索正常 — ${searchEngineStatus}`;
+  }
+  log(`❌ 搜索失败: ${lastSearchError}`);
+  return `❌ 搜索失败 — ${lastSearchError}`;
 }
 
 function formatSearchResults(query: string, results: SearchResult[]): string {
@@ -1035,6 +1057,31 @@ async function runMonitor(account: AccountData): Promise<void> {
         log(`📩 收到消息 from=${fromUser}: ${text.slice(0, 100)}${text.length > 100 ? "..." : ""}`);
         if (mediaType) log(`   📎 附件类型: ${mediaType}`);
 
+        // --- Slash commands ---
+        if (text === "/diag" || text === "/debug") {
+          const diag = `🤖 Claude-Weixin-Bot v1.0.0
+📡 模型: ${CLAUDE_MODEL}
+🔗 API: ${LLM_BASE_URL}
+🔍 搜索引擎: ${searchEngineStatus}
+⚠️ 最后错误: ${lastSearchError || "无"}
+💾 状态: ${isSessionPaused() ? "暂停中" : "运行中"}`;
+          await sendMessage({ baseUrl: account.baseUrl, token: account.botToken, toUserId: fromUser, text: diag, contextToken: getContextToken(fromUser) });
+          log(`📤 诊断回复 to=${fromUser}`);
+          continue;
+        }
+        if (text === "/testsearch" || text.startsWith("/s ")) {
+          const sq = text === "/testsearch" ? "hello world" : text.slice(3).trim();
+          log(`🧪 手动搜索测试: "${sq}"`);
+          const results = await performSearch(sq);
+          if (results.length > 0) {
+            const formatted = formatSearchResults(sq, results);
+            await sendMessage({ baseUrl: account.baseUrl, token: account.botToken, toUserId: fromUser, text: `【搜索正常】${searchEngineStatus}\n\n${formatted}`, contextToken: getContextToken(fromUser) });
+          } else {
+            await sendMessage({ baseUrl: account.baseUrl, token: account.botToken, toUserId: fromUser, text: `【搜索失败】${searchEngineStatus} — ${lastSearchError}`, contextToken: getContextToken(fromUser) });
+          }
+          continue;
+        }
+
         // Build prompt with media awareness
         let prompt = text;
         if (mediaType && !text) {
@@ -1135,8 +1182,16 @@ async function main(): Promise<void> {
   }
 
   log("");
+
+  // Startup self-diagnostic
+  const searchDiag = await testSearch();
+  log(searchDiag);
+
+  log("");
   log("━━━━━━━━━━━━━━━━━━━━━━━━━");
   log("📡 开始监听微信消息...");
+  log("   /diag — 查看诊断信息");
+  log("   /testsearch — 测试搜索");
   log("   按 Ctrl+C 停止");
   log("");
 
