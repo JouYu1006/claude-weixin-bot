@@ -671,14 +671,16 @@ async function callLLM(userId, userMessage, account) {
     let searchHint = "";
     const searchQuery = shouldSearch(userMessage);
     if (searchQuery) {
-        log(`🔍 搜索: ${searchQuery}`);
+        log(`🔍 搜索触发: "${searchQuery}"`);
         const results = await performSearch(searchQuery);
+        log(`🔍 搜索结果: ${results.length} 条`);
         if (results.length > 0) {
             searchContext = `以下是从互联网实时搜索到的信息：\n${formatSearchResults(searchQuery, results)}`;
-            searchHint = "🔍 ";
+            searchHint = "【已联网搜索】 ";
         }
         else {
-            searchHint = "";
+            searchHint = "【搜索无结果】 ";
+            log(`⚠️ 所有搜索引擎均失败`);
         }
     }
     // --- Build prompt ---
