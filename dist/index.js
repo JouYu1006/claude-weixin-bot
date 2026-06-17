@@ -525,7 +525,7 @@ const LLM_TEMPERATURE = parseFloat(process.env.LLM_TEMPERATURE || "0.7");
 const LLM_MAX_TOKENS = parseInt(process.env.LLM_MAX_TOKENS || "8192", 10);
 const LLM_REASONING = process.env.LLM_REASONING || "medium"; // low | medium | high — only for v4-pro
 const conversations = new Map();
-const MAX_CONVERSATION_PAIRS = 20; // 20 round-trips = 40 messages
+const MAX_CONVERSATION_PAIRS = parseInt(process.env.CONVERSATION_ROUNDS || "100", 10);
 const MAX_USERS = 100;
 function getConversation(userId) {
     let convo = conversations.get(userId);

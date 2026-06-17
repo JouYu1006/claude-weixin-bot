@@ -660,7 +660,7 @@ const LLM_REASONING = process.env.LLM_REASONING || "medium"; // low | medium | h
 // Per-user conversation history (max 100 users, LRU eviction)
 type ChatMessage = { role: "system" | "user" | "assistant" | "tool"; content: string; tool_call_id?: string };
 const conversations = new Map<string, ChatMessage[]>();
-const MAX_CONVERSATION_PAIRS = 20; // 20 round-trips = 40 messages
+const MAX_CONVERSATION_PAIRS = parseInt(process.env.CONVERSATION_ROUNDS || "100", 10);
 const MAX_USERS = 100;
 
 function getConversation(userId: string): ChatMessage[] {
