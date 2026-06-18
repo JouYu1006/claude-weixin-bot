@@ -1718,42 +1718,40 @@ async function runMonitor(account) {
                 }
                 // --- Handle media types ---
                 let prompt = text;
-                // Image recognition
+                // Image recognition → feed to LLM for smart understanding
                 if (mediaType === "image") {
                     log(`🖼️  图片消息 — 下载解密识别...`);
                     let recognition = "";
                     try {
                         recognition = await handleImageMessage(msg, fromUser, account) || "";
                         if (recognition) {
-                            await sendMessage({
-                                baseUrl: account.baseUrl, token: account.botToken, toUserId: fromUser,
-                                text: recognition, contextToken: getContextToken(fromUser),
-                            });
-                            log(`📤 图片识别回复: ${recognition.slice(0, 80)}...`);
+                            log(`🔍 图片识别结果: ${recognition.slice(0, 80)}...`);
                         }
                     }
                     catch (err) {
-                        log(`❌ 图片识别失败: ${String(err)}`);
-                        recognition = "抱歉，图片识别失败，请稍后再试。";
+                        log(`❌ 图片下载/解密失败: ${String(err)}`);
+                    }
+                    // 把识别结果作为上下文，交给 LLM 理解后回复
+                    if (recognition && !recognition.startsWith("抱歉")) {
+                        prompt = `[用户发送了一张图片，视觉AI识别结果如下：]\n\n"${recognition}"\n\n---\n请根据以上图片内容，用中文回答用户的问题。用户${text ? `说："${text}"` : "没有附加文字，请根据图片内容主动提供帮助（如总结、解释、翻译图中的文字等）"}`;
+                        // Fall through to LLM call below
+                    }
+                    else {
+                        // 识别失败，告诉用户
                         await sendMessage({
                             baseUrl: account.baseUrl, token: account.botToken, toUserId: fromUser,
-                            text: recognition, contextToken: getContextToken(fromUser),
+                            text: recognition || "抱歉，图片处理失败，请稍后再试。", contextToken: getContextToken(fromUser),
                         });
+                        continue;
                     }
-                    // 存入对话上下文，避免说完就忘
-                    if (recognition) {
-                        const picConvo = getConversation(fromUser);
-                        picConvo.push({ role: "user", content: text ? `[图片] ${text}` : "[发送了一张图片]" });
-                        picConvo.push({ role: "assistant", content: recognition });
-                        trimConversation(picConvo);
+                }
+                if (mediaType && mediaType !== "image") {
+                    if (!text) {
+                        prompt = `[用户发送了一个${mediaType === "voice" ? "语音" : mediaType === "file" ? "文件" : "视频"}，但我暂不支持直接查看]`;
                     }
-                    continue; // handled, skip LLM call
-                }
-                if (mediaType && !text) {
-                    prompt = `[用户发送了一个${mediaType === "voice" ? "语音" : mediaType === "file" ? "文件" : "视频"}，但我暂不支持直接查看]`;
-                }
-                else if (mediaType && text) {
-                    prompt = `[用户发送了一段消息并附带了一个${mediaType === "voice" ? "语音" : mediaType === "file" ? "文件" : "视频"}]\n${text}`;
+                    else {
+                        prompt = `[用户发送了一段消息并附带了一个${mediaType === "voice" ? "语音" : mediaType === "file" ? "文件" : "视频"}]\n${text}`;
+                    }
                 }
                 // Call LLM and reply
                 try {
