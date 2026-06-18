@@ -745,12 +745,39 @@ async function recognizeImage(
 
   const failReasons: string[] = [];
 
-  // Try 1: nonelinear Gemini Flash (cheap, always available)
-  const nlKey = process.env.NONELINEAR_API_KEY;
-  const nlBase = process.env.NONELINEAR_BASE_URL || "https://api.nonelinear.com/v1";
+  // Try 0: nonelinear via raw fetch (bypass SDK quirks)
+  const nlKey = (process.env.NONELINEAR_API_KEY || "").trim();
+  const nlBase = (process.env.NONELINEAR_BASE_URL || "https://api.nonelinear.com/v1").trim();
   if (nlKey) {
     try {
-      log("🔄 nonelinear Gemini...");
+      log(`🔄 nonelinear fetch...`);
+      const body = JSON.stringify({
+        model: "gemini-2.5-flash",
+        messages: [{ role: "user", content: msgContent }],
+        max_tokens: 4096, temperature: 0.3,
+      });
+      const fr = await fetch(`${nlBase}/chat/completions`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${nlKey}`, "Content-Type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(60000),
+      });
+      const j = await fr.json() as any;
+      if (!fr.ok) {
+        failReasons.push(`nonelinear-fetch: ${fr.status} ${JSON.stringify(j).slice(0, 100)}`);
+      } else {
+        const msg = j.choices?.[0]?.message;
+        const text = extractContent(msg);
+        if (text.trim()) { log("✅ nonelinear-fetch: " + text.slice(0, 60)); return text; }
+        failReasons.push(`nonelinear-fetch: content=${(msg?.content||"").length} reasoning=${(msg?.reasoning_content||"").length} tokens=${j.usage?.total_tokens||0}`);
+      }
+    } catch (err: any) {
+      failReasons.push(`nonelinear-fetch: ${String(err).slice(0, 100)}`);
+    }
+
+    // Fallback: try via OpenAI SDK
+    try {
+      log(`🔄 nonelinear SDK...`);
       const nl = new OpenAI({ apiKey: nlKey, baseURL: nlBase });
       const resp = await nl.chat.completions.create({
         model: "gemini-2.5-flash",
@@ -759,14 +786,10 @@ async function recognizeImage(
       });
       const msg = resp.choices?.[0]?.message as any;
       const text = extractContent(msg);
-      if (text.trim()) { log("✅ nonelinear: " + text.slice(0, 60)); return text; }
-      // diagnose why empty
-      const cLen = (msg?.content || "").length;
-      const rcLen = (msg?.reasoning_content || "").length;
-      const tokens = resp.usage?.total_tokens ?? 0;
-      failReasons.push(`nonelinear: content=${cLen} reasoning=${rcLen} tokens=${tokens}`);
+      if (text.trim()) { log("✅ nonelinear-SDK: " + text.slice(0, 60)); return text; }
+      failReasons.push(`nonelinear-SDK: content=${(msg?.content||"").length} reasoning=${(msg?.reasoning_content||"").length} tokens=${resp.usage?.total_tokens??0}`);
     } catch (err: any) {
-      failReasons.push(`nonelinear: ${String(err).slice(0, 80)}`);
+      failReasons.push(`nonelinear-SDK: ${String(err).slice(0, 80)}`);
     }
   } else {
     failReasons.push("nonelinear: 未配置KEY");
