@@ -1880,8 +1880,9 @@ async function runMonitor(account: AccountData): Promise<void> {
         // Image recognition
         if (mediaType === "image") {
           log(`🖼️  图片消息 — 下载解密识别...`);
+          let recognition = "";
           try {
-            const recognition = await handleImageMessage(msg, fromUser, account);
+            recognition = await handleImageMessage(msg, fromUser, account) || "";
             if (recognition) {
               await sendMessage({
                 baseUrl: account.baseUrl, token: account.botToken, toUserId: fromUser,
@@ -1891,10 +1892,18 @@ async function runMonitor(account: AccountData): Promise<void> {
             }
           } catch (err) {
             log(`❌ 图片识别失败: ${String(err)}`);
+            recognition = "抱歉，图片识别失败，请稍后再试。";
             await sendMessage({
               baseUrl: account.baseUrl, token: account.botToken, toUserId: fromUser,
-              text: "抱歉，图片识别失败，请稍后再试。", contextToken: getContextToken(fromUser),
+              text: recognition, contextToken: getContextToken(fromUser),
             });
+          }
+          // 存入对话上下文，避免说完就忘
+          if (recognition) {
+            const picConvo = getConversation(fromUser);
+            picConvo.push({ role: "user", content: text ? `[图片] ${text}` : "[发送了一张图片]" });
+            picConvo.push({ role: "assistant", content: recognition });
+            trimConversation(picConvo);
           }
           continue; // handled, skip LLM call
         }
