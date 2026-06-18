@@ -592,7 +592,29 @@ async function recognizeImage(imageBuffer, userPrompt) {
         { type: "image_url", image_url: { url: "data:" + mimeType + ";base64," + base64 } },
         { type: "text", text: userPrompt || "请描述这张图片的内容，包括里面的文字、物品、场景。" },
     ];
-    // Try 1: SiliconFlow (free, accessible from China)
+    // Try 1: nonelinear Gemini Flash (cheap, always available)
+    const nlKey = process.env.NONELINEAR_API_KEY;
+    const nlBase = process.env.NONELINEAR_BASE_URL || "https://api.nonelinear.com/v1";
+    if (nlKey) {
+        try {
+            log("🔄 nonelinear Gemini...");
+            const nl = new OpenAI({ apiKey: nlKey, baseURL: nlBase });
+            const resp = await nl.chat.completions.create({
+                model: "gemini-2.5-flash",
+                messages: [{ role: "user", content: msgContent }],
+                max_tokens: 2048, temperature: 0.3, stream: false,
+            });
+            const text = resp.choices?.[0]?.message?.content || "";
+            if (text.trim()) {
+                log("✅ nonelinear: " + text.slice(0, 60));
+                return text;
+            }
+        }
+        catch (err) {
+            log("⚠️ nonelinear: " + String(err).slice(0, 80));
+        }
+    }
+    // Try 2: SiliconFlow (free tier)
     const sfKey = process.env.SILICONFLOW_API_KEY;
     if (sfKey) {
         try {
@@ -612,23 +634,6 @@ async function recognizeImage(imageBuffer, userPrompt) {
         catch (err) {
             log("⚠️ SiliconFlow: " + String(err).slice(0, 80));
         }
-    }
-    // Try 2: DeepSeek V4 vision
-    try {
-        const client = new OpenAI({ apiKey: process.env.LLM_API_KEY, baseURL: LLM_BASE_URL });
-        const resp = await client.chat.completions.create({
-            model: CLAUDE_MODEL,
-            messages: [{ role: "user", content: msgContent }],
-            max_tokens: 2048, temperature: 0.3, stream: false,
-        });
-        const text = resp.choices?.[0]?.message?.content || "";
-        if (text.trim()) {
-            log("✅ DeepSeek: " + text.slice(0, 60));
-            return text;
-        }
-    }
-    catch (err) {
-        log("⚠️ DeepSeek: " + String(err).slice(0, 80));
     }
     // Try 3: Groq
     const groqKey = process.env.GROQ_API_KEY;
@@ -651,7 +656,7 @@ async function recognizeImage(imageBuffer, userPrompt) {
             log("⚠️ Groq: " + String(err).slice(0, 80));
         }
     }
-    return "抱歉，视觉功能需要 API Key。请在 Railway Variables 添加 SILICONFLOW_API_KEY（推荐，国内可注册 cloud.siliconflow.cn）。";
+    return "抱歉，图片识别暂时不可用。";
 }
 /** Handle image message: download, decrypt, recognize, reply */
 async function handleImageMessage(msg, fromUser, account) {
@@ -697,6 +702,9 @@ const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || `你是一个专业、可靠�
 const LLM_TEMPERATURE = parseFloat(process.env.LLM_TEMPERATURE || "0.7");
 const LLM_MAX_TOKENS = parseInt(process.env.LLM_MAX_TOKENS || "8192", 10);
 const LLM_REASONING = process.env.LLM_REASONING || "medium"; // low | medium | high — only for v4-pro
+// nonelinear: 图片识别 & 搜索兜底 (Gemini)
+const NL_API_KEY = process.env.NONELINEAR_API_KEY || "";
+const NL_BASE_URL = process.env.NONELINEAR_BASE_URL || "https://api.nonelinear.com/v1";
 const MEMORY_DIR = path.join(STATE_DIR, "memory");
 function memoryPath(userId) {
     return path.join(MEMORY_DIR, `${userId.replace(/[@:\/\\]/g, "_")}.json`);
@@ -817,16 +825,28 @@ function shouldSearch(text) {
     // Short "?" prefix: "?xxx" triggers search
     if (t.startsWith("?"))
         return t.slice(1).trim();
-    // Auto-detect: time-sensitive / factual keywords
+    // Auto-detect: time-sensitive / factual / question keywords
     const triggers = [
+        // Time-sensitive
         "今天", "现在", "最近", "最新", "刚刚", "当前", "实时", "目前",
         "新闻", "天气", "股价", "汇率", "热搜", "发生什么", "发生了什么",
         "动态", "进展", "更新", "变化", "趋势", "行情",
         "几点了", "星期几", "日期", "时间",
         "realtime", "today", "news", "latest", "update",
+        // Question patterns → likely factual lookup needed
+        "是什么", "什么是", "为什么", "怎么", "如何",
+        "多少钱", "多少", "哪个", "哪里", "在哪", "怎么样",
+        "区别", "对比", "比较", "排名", "排行榜",
+        "是什么", "解释", "定义",
+        // Tech/product queries
+        "发布了", "推出了", "更新了", "发布", "上市",
+        "多少钱", "价格", "售价",
     ];
-    if (triggers.some(kw => t.toLowerCase().includes(kw.toLowerCase())))
+    if (triggers.some(kw => t.includes(kw)))
         return t;
+    // Auto-detect: contains URL → user sharing a link, search for context
+    if (/https?:\/\//.test(t))
+        return null; // don't search URLs, they'll be fetched directly
     return null;
 }
 /**
@@ -1617,10 +1637,11 @@ async function runMonitor(account) {
                     log(`   📎 附件类型: ${mediaType}`);
                 // --- Slash commands ---
                 if (text === "/diag" || text === "/debug") {
-                    const diag = `🤖 Claude-Weixin-Bot v1.0.0
+                    const diag = `🤖 Claude-Weixin-Bot v1.1.0
 📡 模型: ${CLAUDE_MODEL}
 🧠 推理: ${LLM_REASONING} | 温度: ${LLM_TEMPERATURE} | tokens: ${LLM_MAX_TOKENS}
 🔗 API: ${LLM_BASE_URL}
+🖼️  图片: ${NL_API_KEY ? "✅ nonelinear Gemini" : "❌ 未配置"}
 🔍 搜索: ${searchEngineStatus}
 🧠 记忆: ${loadMemories(fromUser).length} 条
 ⏰ 推送: ${DAILY_PUSH_TIME || "关闭"}
