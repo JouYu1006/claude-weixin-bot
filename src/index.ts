@@ -743,6 +743,8 @@ async function recognizeImage(
     return "";
   };
 
+  const failReasons: string[] = [];
+
   // Try 1: nonelinear Gemini Flash (cheap, always available)
   const nlKey = process.env.NONELINEAR_API_KEY;
   const nlBase = process.env.NONELINEAR_BASE_URL || "https://api.nonelinear.com/v1";
@@ -755,9 +757,19 @@ async function recognizeImage(
         messages: [{ role: "user", content: msgContent }] as any,
         max_tokens: 4096, temperature: 0.3, stream: false,
       });
-      const text = extractContent(resp.choices?.[0]?.message);
+      const msg = resp.choices?.[0]?.message as any;
+      const text = extractContent(msg);
       if (text.trim()) { log("✅ nonelinear: " + text.slice(0, 60)); return text; }
-    } catch (err) { log("⚠️ nonelinear: " + String(err).slice(0, 80)); }
+      // diagnose why empty
+      const cLen = (msg?.content || "").length;
+      const rcLen = (msg?.reasoning_content || "").length;
+      const tokens = resp.usage?.total_tokens ?? 0;
+      failReasons.push(`nonelinear: content=${cLen} reasoning=${rcLen} tokens=${tokens}`);
+    } catch (err: any) {
+      failReasons.push(`nonelinear: ${String(err).slice(0, 80)}`);
+    }
+  } else {
+    failReasons.push("nonelinear: 未配置KEY");
   }
 
   // Try 2: SiliconFlow (free tier)
@@ -773,7 +785,8 @@ async function recognizeImage(
       });
       const text = extractContent(resp.choices?.[0]?.message);
       if (text.trim()) { log("✅ SiliconFlow: " + text.slice(0, 60)); return text; }
-    } catch (err) { log("⚠️ SiliconFlow: " + String(err).slice(0, 80)); }
+      failReasons.push("SiliconFlow: 返回空");
+    } catch (err: any) { failReasons.push(`SiliconFlow: ${String(err).slice(0, 80)}`); }
   }
 
   // Try 3: Groq
@@ -789,10 +802,11 @@ async function recognizeImage(
       });
       const text = extractContent(resp.choices?.[0]?.message);
       if (text.trim()) { log("✅ Groq: " + text.slice(0, 60)); return text; }
-    } catch (err) { log("⚠️ Groq: " + String(err).slice(0, 80)); }
+      failReasons.push("Groq: 返回空");
+    } catch (err: any) { failReasons.push(`Groq: ${String(err).slice(0, 80)}`); }
   }
 
-  return "抱歉，图片识别暂时不可用。";
+  return `抱歉，图片识别暂时不可用。\n[${failReasons.join(" | ")}]`;
 }
 
 /** Handle image message: download, decrypt, recognize, reply */
