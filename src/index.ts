@@ -733,6 +733,16 @@ async function recognizeImage(
     { type: "text", text: userPrompt || "请描述这张图片的内容，包括里面的文字、物品、场景。" },
   ];
 
+  // Helper: Gemini thinking may consume content, fallback to reasoning_content
+  const extractContent = (msg: any): string => {
+    const c = msg?.content || "";
+    if (c.trim()) return c;
+    // fallback: reasoning_content (Gemini thinking output)
+    const rc = msg?.reasoning_content;
+    if (typeof rc === "string" && rc.trim()) return rc;
+    return "";
+  };
+
   // Try 1: nonelinear Gemini Flash (cheap, always available)
   const nlKey = process.env.NONELINEAR_API_KEY;
   const nlBase = process.env.NONELINEAR_BASE_URL || "https://api.nonelinear.com/v1";
@@ -743,9 +753,9 @@ async function recognizeImage(
       const resp = await nl.chat.completions.create({
         model: "gemini-2.5-flash",
         messages: [{ role: "user", content: msgContent }] as any,
-        max_tokens: 2048, temperature: 0.3, stream: false,
+        max_tokens: 4096, temperature: 0.3, stream: false,
       });
-      const text = resp.choices?.[0]?.message?.content || "";
+      const text = extractContent(resp.choices?.[0]?.message);
       if (text.trim()) { log("✅ nonelinear: " + text.slice(0, 60)); return text; }
     } catch (err) { log("⚠️ nonelinear: " + String(err).slice(0, 80)); }
   }
@@ -761,7 +771,7 @@ async function recognizeImage(
         messages: [{ role: "user", content: msgContent }] as any,
         max_tokens: 2048, temperature: 0.3, stream: false,
       });
-      const text = resp.choices?.[0]?.message?.content || "";
+      const text = extractContent(resp.choices?.[0]?.message);
       if (text.trim()) { log("✅ SiliconFlow: " + text.slice(0, 60)); return text; }
     } catch (err) { log("⚠️ SiliconFlow: " + String(err).slice(0, 80)); }
   }
@@ -777,7 +787,7 @@ async function recognizeImage(
         messages: [{ role: "user", content: msgContent }] as any,
         max_tokens: 2048, temperature: 0.3, stream: false,
       });
-      const text = resp.choices?.[0]?.message?.content || "";
+      const text = extractContent(resp.choices?.[0]?.message);
       if (text.trim()) { log("✅ Groq: " + text.slice(0, 60)); return text; }
     } catch (err) { log("⚠️ Groq: " + String(err).slice(0, 80)); }
   }
