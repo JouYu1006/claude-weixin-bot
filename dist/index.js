@@ -338,6 +338,10 @@ async function doLogin() {
                 };
                 saveAccount(account);
                 log(`✅ 登录成功！Bot ID: ${account.accountId}`);
+                if (!process.env.ACCOUNT_JSON) {
+                    // 云端部署：把登录凭证输出到日志，保存为 ACCOUNT_JSON 环境变量后重启免扫码
+                    log(`ACCOUNT_JSON=${JSON.stringify(account)}`);
+                }
                 return account;
             }
         }
@@ -584,7 +588,7 @@ async function downloadWeChatImage(info) {
         return null;
     }
 }
-/** Send image to vision model — DeepSeek first, fallback to Groq (free) */
+/** Send image to Kimi vision model (kimi-k2.6) */
 async function recognizeImage(imageBuffer, userPrompt) {
     const base64 = imageBuffer.toString("base64");
     const mimeType = "image/jpeg";
@@ -592,121 +596,35 @@ async function recognizeImage(imageBuffer, userPrompt) {
         { type: "image_url", image_url: { url: "data:" + mimeType + ";base64," + base64 } },
         { type: "text", text: userPrompt || "请描述这张图片的内容，包括里面的文字、物品、场景。" },
     ];
-    // Helper: Gemini thinking may consume content, fallback to reasoning_content
+    // Helper: 推理模型可能把输出放在 reasoning_content，content 为空时回退
     const extractContent = (msg) => {
         const c = msg?.content || "";
         if (c.trim())
             return c;
-        // fallback: reasoning_content (Gemini thinking output)
+        // fallback: reasoning_content (推理输出)
         const rc = msg?.reasoning_content;
         if (typeof rc === "string" && rc.trim())
             return rc;
         return "";
     };
-    const failReasons = [];
-    // Try 0: nonelinear via raw fetch (bypass SDK quirks)
-    const nlKey = (process.env.NONELINEAR_API_KEY || "").trim();
-    const nlBase = (process.env.NONELINEAR_BASE_URL || "https://api.nonelinear.com/v1").trim();
-    if (nlKey) {
-        try {
-            log(`🔄 nonelinear fetch...`);
-            const body = JSON.stringify({
-                model: "gemini-2.5-flash",
-                messages: [{ role: "user", content: msgContent }],
-                max_tokens: 4096, temperature: 0.3,
-            });
-            const fr = await fetch(`${nlBase}/chat/completions`, {
-                method: "POST",
-                headers: { "Authorization": `Bearer ${nlKey}`, "Content-Type": "application/json" },
-                body,
-                signal: AbortSignal.timeout(60000),
-            });
-            const j = await fr.json();
-            if (!fr.ok) {
-                failReasons.push(`nonelinear-fetch: ${fr.status} ${JSON.stringify(j).slice(0, 100)}`);
-            }
-            else {
-                const msg = j.choices?.[0]?.message;
-                const text = extractContent(msg);
-                if (text.trim()) {
-                    log("✅ nonelinear-fetch: " + text.slice(0, 60));
-                    return text;
-                }
-                failReasons.push(`nonelinear-fetch: content=${(msg?.content || "").length} reasoning=${(msg?.reasoning_content || "").length} tokens=${j.usage?.total_tokens || 0}`);
-            }
+    try {
+        log(`🔄 Kimi 视觉识别 (${VISION_MODEL})...`);
+        const client = new OpenAI({ apiKey: process.env.LLM_API_KEY, baseURL: LLM_BASE_URL });
+        const resp = await client.chat.completions.create({
+            model: VISION_MODEL,
+            messages: [{ role: "user", content: msgContent }],
+            max_tokens: 4096, stream: false,
+        });
+        const text = extractContent(resp.choices?.[0]?.message);
+        if (text.trim()) {
+            log("✅ 视觉识别: " + text.slice(0, 60));
+            return text;
         }
-        catch (err) {
-            failReasons.push(`nonelinear-fetch: ${String(err).slice(0, 100)}`);
-        }
-        // Fallback: try via OpenAI SDK
-        try {
-            log(`🔄 nonelinear SDK...`);
-            const nl = new OpenAI({ apiKey: nlKey, baseURL: nlBase });
-            const resp = await nl.chat.completions.create({
-                model: "gemini-2.5-flash",
-                messages: [{ role: "user", content: msgContent }],
-                max_tokens: 4096, temperature: 0.3, stream: false,
-            });
-            const msg = resp.choices?.[0]?.message;
-            const text = extractContent(msg);
-            if (text.trim()) {
-                log("✅ nonelinear-SDK: " + text.slice(0, 60));
-                return text;
-            }
-            failReasons.push(`nonelinear-SDK: content=${(msg?.content || "").length} reasoning=${(msg?.reasoning_content || "").length} tokens=${resp.usage?.total_tokens ?? 0}`);
-        }
-        catch (err) {
-            failReasons.push(`nonelinear-SDK: ${String(err).slice(0, 80)}`);
-        }
+        return "抱歉，图片识别失败: 模型返回为空";
     }
-    else {
-        failReasons.push("nonelinear: 未配置KEY");
+    catch (err) {
+        return `抱歉，图片识别失败: ${String(err).slice(0, 100)}`;
     }
-    // Try 2: SiliconFlow (free tier)
-    const sfKey = process.env.SILICONFLOW_API_KEY;
-    if (sfKey) {
-        try {
-            log("🔄 SiliconFlow...");
-            const sf = new OpenAI({ apiKey: sfKey, baseURL: "https://api.siliconflow.cn/v1" });
-            const resp = await sf.chat.completions.create({
-                model: "Qwen/Qwen3-VL-32B",
-                messages: [{ role: "user", content: msgContent }],
-                max_tokens: 2048, temperature: 0.3, stream: false,
-            });
-            const text = extractContent(resp.choices?.[0]?.message);
-            if (text.trim()) {
-                log("✅ SiliconFlow: " + text.slice(0, 60));
-                return text;
-            }
-            failReasons.push("SiliconFlow: 返回空");
-        }
-        catch (err) {
-            failReasons.push(`SiliconFlow: ${String(err).slice(0, 80)}`);
-        }
-    }
-    // Try 3: Groq
-    const groqKey = process.env.GROQ_API_KEY;
-    if (groqKey) {
-        try {
-            log("🔄 Groq...");
-            const groq = new OpenAI({ apiKey: groqKey, baseURL: "https://api.groq.com/openai/v1" });
-            const resp = await groq.chat.completions.create({
-                model: "llama-4-scout-17b-16e-instruct",
-                messages: [{ role: "user", content: msgContent }],
-                max_tokens: 2048, temperature: 0.3, stream: false,
-            });
-            const text = extractContent(resp.choices?.[0]?.message);
-            if (text.trim()) {
-                log("✅ Groq: " + text.slice(0, 60));
-                return text;
-            }
-            failReasons.push("Groq: 返回空");
-        }
-        catch (err) {
-            failReasons.push(`Groq: ${String(err).slice(0, 80)}`);
-        }
-    }
-    return `抱歉，图片识别暂时不可用。\n[${failReasons.join(" | ")}]`;
 }
 /** Handle image message: download, decrypt, recognize, reply */
 async function handleImageMessage(msg, fromUser, account) {
@@ -738,8 +656,8 @@ async function handleImageMessage(msg, fromUser, account) {
 // ---------------------------------------------------------------------------
 // Claude integration
 // ---------------------------------------------------------------------------
-const CLAUDE_MODEL = process.env.LLM_MODEL || "deepseek-chat";
-const LLM_BASE_URL = process.env.LLM_BASE_URL || "https://api.deepseek.com/v1";
+const CLAUDE_MODEL = process.env.LLM_MODEL || "kimi-k3";
+const LLM_BASE_URL = process.env.LLM_BASE_URL || "https://api.moonshot.cn/v1";
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || `你是一个专业、可靠的智能助手，通过微信与用户交流。请遵循以下原则：
 
 1. **深度理解**：仔细分析用户问题的核心意图，不要浮于表面。
@@ -751,10 +669,12 @@ const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || `你是一个专业、可靠�
 7. **诚实边界**：如果你不确定某事，明确告知并给出获取信息的建议，而不是编造。`;
 const LLM_TEMPERATURE = parseFloat(process.env.LLM_TEMPERATURE || "0.7");
 const LLM_MAX_TOKENS = parseInt(process.env.LLM_MAX_TOKENS || "8192", 10);
-const LLM_REASONING = process.env.LLM_REASONING || "medium"; // low | medium | high — only for v4-pro
-// nonelinear: 图片识别 & 搜索兜底 (Gemini)
-const NL_API_KEY = process.env.NONELINEAR_API_KEY || "";
-const NL_BASE_URL = process.env.NONELINEAR_BASE_URL || "https://api.nonelinear.com/v1";
+const LLM_REASONING = process.env.LLM_REASONING || "high"; // low | high | max — kimi-k3 始终推理
+// 视觉模型 (图片/视频输入) & 记忆抽取模型
+const VISION_MODEL = process.env.VISION_MODEL || "kimi-k2.6";
+const MEMORY_MODEL = process.env.MEMORY_MODEL || "kimi-k2.6";
+// 联网搜索/工具降级模型 — kimi-k3 的 $web_search 续传有服务端 bug（400 tokenization failed），k2.6 正常
+const SEARCH_MODEL = process.env.SEARCH_MODEL || "kimi-k2.6";
 const MEMORY_DIR = path.join(STATE_DIR, "memory");
 function memoryPath(userId) {
     return path.join(MEMORY_DIR, `${userId.replace(/[@:\/\\]/g, "_")}.json`);
@@ -813,13 +733,12 @@ function extractFactsInBackground(userId, userMsg, assistantMsg) {
             const oldFacts = existing.slice(-10).map(e => `- ${e.fact}`).join("\n");
             const client = new OpenAI({ apiKey: process.env.LLM_API_KEY, baseURL: LLM_BASE_URL });
             const resp = await client.chat.completions.create({
-                model: "deepseek-v4-flash", // cheap model for extraction
+                model: MEMORY_MODEL, // cheap model for extraction
                 messages: [
                     { role: "system", content: `你是一个信息提取助手。从用户和助手的对话中提取关于用户的重要事实。只输出 JSON 数组，每条包含 fact(事实描述)、category(personal/preference/context/topic)。不要重复已有的内容。无新信息则输出 []。` },
                     { role: "user", content: `已有事实：\n${oldFacts || "(无)"}\n\n用户消息：${userMsg.slice(0, 500)}\n\n助手回复：${assistantMsg.slice(0, 500)}\n\n请提取新的或更新的事实：` }
                 ],
                 max_tokens: 512,
-                temperature: 0.3,
                 response_format: { type: "json_object" },
             });
             const text = resp.choices?.[0]?.message?.content || "[]";
@@ -865,357 +784,6 @@ function trimConversation(convo) {
         convo.splice(0, convo.length - maxMsgs);
     }
 }
-/** Heuristic: does this message likely need a web search? */
-function shouldSearch(text) {
-    const t = text.trim();
-    // Explicit: "搜索 xxx", "搜 xxx", "/s xxx"
-    const explicit = t.match(/^(?:搜索|搜一下|查一下|帮我搜|帮我查|网上查|联网搜|查查|\/s|\/search)[：:\s]+(.+)/i);
-    if (explicit)
-        return explicit[1].trim();
-    // Short "?" prefix: "?xxx" triggers search
-    if (t.startsWith("?"))
-        return t.slice(1).trim();
-    // Auto-detect: time-sensitive / factual / question keywords
-    const triggers = [
-        // Time-sensitive
-        "今天", "现在", "最近", "最新", "刚刚", "当前", "实时", "目前",
-        "新闻", "天气", "股价", "汇率", "热搜", "发生什么", "发生了什么",
-        "动态", "进展", "更新", "变化", "趋势", "行情",
-        "几点了", "星期几", "日期", "时间",
-        "realtime", "today", "news", "latest", "update",
-        // Question patterns → likely factual lookup needed
-        "是什么", "什么是", "为什么", "怎么", "如何",
-        "多少钱", "多少", "哪个", "哪里", "在哪", "怎么样",
-        "区别", "对比", "比较", "排名", "排行榜",
-        "是什么", "解释", "定义",
-        // Tech/product queries
-        "发布了", "推出了", "更新了", "发布", "上市",
-        "多少钱", "价格", "售价",
-    ];
-    if (triggers.some(kw => t.includes(kw)))
-        return t;
-    // Auto-detect: contains URL → user sharing a link, search for context
-    if (/https?:\/\//.test(t))
-        return null; // don't search URLs, they'll be fetched directly
-    return null;
-}
-/**
- * Search engine status (set by startup self-test, visible via /diag)
- */
-/** Improve Chinese queries for English search engines */
-function optimizeSearchQuery(raw) {
-    const hasChinese = /[一-鿿]/.test(raw);
-    if (!hasChinese)
-        return raw;
-    const now = new Date();
-    const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-    // Detect intent and build clean English query
-    const isNews = /新闻|动态|最新|今天|最近|进展|大事/.test(raw);
-    const isTech = /科技|技术|AI|人工智能|数码|手机|电脑|软件/.test(raw);
-    const isWeather = /天气|气温|下雨|台风/.test(raw);
-    const isStock = /股价|股票|大盘|基金|币|行情/.test(raw);
-    const isSport = /比赛|足球|篮球|NBA|英超|中超|体育/.test(raw);
-    // Extract meaningful nouns (keep English words and Chinese characters)
-    const cleanChinese = raw
-        .replace(/[？?!！。，,、\s]+/g, " ")
-        .replace(/(有什么|是什么|怎么样|如何|有哪些|帮我|搜一下|查一下|一下|吗|吧|最近|最新|今天|现在|的)/g, "")
-        .replace(/\s{2,}/g, " ")
-        .trim();
-    // Extract any English/alphanumeric words (product names, model numbers, etc.)
-    const engWords = raw.match(/[A-Za-z0-9]+/g)?.join(" ") || "";
-    let q = "";
-    if (isWeather) {
-        q = `weather forecast today`;
-    }
-    else if (isStock) {
-        q = engWords ? `${engWords} stock price` : "stock market";
-        if (cleanChinese.length > 2)
-            q += ` ${cleanChinese}`;
-    }
-    else if (isSport) {
-        q = engWords ? `${engWords} sports` : `sports news ${dateStr}`;
-    }
-    else if (isTech && isNews) {
-        q = `latest technology news ${dateStr}`;
-        if (engWords)
-            q = `${engWords} ${q}`;
-    }
-    else if (isNews) {
-        q = `latest news ${dateStr}`;
-        if (engWords)
-            q = `${engWords} ${q}`;
-    }
-    else if (isTech) {
-        q = engWords ? `${engWords} technology` : `technology`;
-        if (cleanChinese.length > 2 && cleanChinese !== engWords)
-            q += ` ${cleanChinese}`;
-    }
-    else {
-        // General: merge English words + cleaned Chinese, deduplicating
-        const parts = new Set();
-        if (engWords)
-            engWords.split(/\s+/).forEach(w => parts.add(w.toLowerCase()));
-        cleanChinese.split(/\s+/).forEach(w => { const l = w.toLowerCase(); if (!parts.has(l))
-            parts.add(w); });
-        q = [...parts].join(" ");
-    }
-    return q || raw.replace(/[？?!！。，,、]/g, " ").trim();
-}
-let searchEngineStatus = "未检测";
-let lastSearchError = "";
-/**
- * Reliable search: DDG JSON API (free, no key, works from US datacenters).
- */
-async function performSearch(query) {
-    const slog = (msg) => { log(`[search] ${msg}`); };
-    let anyEngineReachable = false;
-    let status = "";
-    const isNewsItem = /news|新闻|动态|进展|大事|\d{4}-\d{2}-\d{2}/.test(query);
-    // Engine 1 (news): Google News RSS — free, real articles with titles+snippets
-    if (isNewsItem) {
-        try {
-            const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`;
-            slog(`Google News RSS...`);
-            const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
-            const xml = await resp.text();
-            anyEngineReachable = true;
-            const results = [];
-            const itemRe = /<item>([\s\S]*?)<\/item>/gi;
-            let m;
-            while ((m = itemRe.exec(xml)) !== null && results.length < 8) {
-                const item = m[1];
-                // CDATA or plain text for title/desc/link
-                const tm = /<title>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))\s*<\/title>/i.exec(item);
-                const sm = /<description>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))\s*<\/description>/i.exec(item);
-                const lm = /<link>\s*(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))\s*<\/link>/i.exec(item);
-                // Google News: <source url="...">Name</source>
-                const srcUrlM = /<source\b[^>]*url="([^"]*)"/i.exec(item);
-                const srcNameM = /<source\b[^>]*>([^<]*)<\/source>/i.exec(item);
-                const title = (tm?.[1] || tm?.[2] || "").replace(/<[^>]+>/g, "").trim();
-                let snippet = (sm?.[1] || sm?.[2] || "").replace(/<[^>]+>/g, "").trim();
-                const link = (lm?.[1] || lm?.[2] || "").trim();
-                const source = srcNameM?.[1]?.trim() || "";
-                if (title && title.length > 5 && !/video|watch|live/i.test(title)) {
-                    if (source)
-                        snippet = `[来源: ${source}] ${snippet}`;
-                    results.push({ title, snippet, url: link.trim() });
-                }
-            }
-            slog(`Google News: ${resp.status}, ${results.length} articles`);
-            status = "Google News OK";
-            if (results.length > 0) {
-                searchEngineStatus = status;
-                lastSearchError = "";
-                return results;
-            }
-        }
-        catch (err) {
-            slog(`Google News err: ${String(err)}`);
-        }
-    }
-    // Engine 2: DDG HTML
-    try {
-        const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-        slog(`DDG HTML...`);
-        const resp = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { "User-Agent": "Mozilla/5.0 (compatible; ClaudeWeixinBot/1.0)" } });
-        anyEngineReachable = true;
-        const html = await resp.text();
-        const results = [];
-        const re = /class="result__body"[^>]*>([\s\S]*?)<\/td>/gi;
-        let b;
-        while ((b = re.exec(html)) !== null && results.length < 8) {
-            const body = b[1];
-            const tm = /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
-            const sm = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
-            if (tm) {
-                const t = tm[2].replace(/<[^>]+>/g, "").trim();
-                if (t)
-                    results.push({ title: t, snippet: sm?.[1]?.replace(/<[^>]+>/g, "").trim() || "", url: tm[1].startsWith("//") ? `https:${tm[1]}` : tm[1] });
-            }
-        }
-        slog(`DDG HTML: ${resp.status}, ${results.length} results`);
-        status = "DDG HTML OK";
-        if (results.length > 0) {
-            searchEngineStatus = status;
-            lastSearchError = "";
-            return results;
-        }
-    }
-    catch (err) {
-        slog(`DDG HTML err: ${String(err)}`);
-    }
-    // Engine 2: Bing HTML (current structure, tested 2026-06)
-    try {
-        const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=10&setlang=en`;
-        slog(`Bing...`);
-        const resp = await fetch(url, { signal: AbortSignal.timeout(12000), headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "en-US,en;q=0.9" } });
-        anyEngineReachable = true;
-        const html = await resp.text();
-        slog(`Bing: ${resp.status}, ${html.length}b`);
-        const results = [];
-        // Structure: <li class="b_algo"> ... <a target="_blank" href="URL">TITLE</a> ... <p>SNIPPET</p> ... </li>
-        const blockRe = /<li class="b_algo"[^>]*>([\s\S]*?)<\/li>/gi;
-        let b2;
-        while ((b2 = blockRe.exec(html)) !== null && results.length < 8) {
-            const body = b2[1];
-            // Title: the second <a> with target="_blank" usually has the clean title
-            const titleM = /<a[^>]*target="_blank"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body)
-                || /<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(body);
-            // Snippet: first <p> with content
-            const snipM = /<p[^>]*>([\s\S]{10,500}?)<\/p>/i.exec(body);
-            if (titleM) {
-                const title = titleM[2].replace(/<[^>]+>/g, "").trim();
-                const url = titleM[1].startsWith("http") ? titleM[1] : `https://www.bing.com${titleM[1]}`;
-                const snippet = snipM ? snipM[1].replace(/<[^>]+>/g, "").trim() : "";
-                if (title && title.length > 3 && !/baidu\.com|百度/.test(title))
-                    results.push({ title, snippet, url });
-            }
-        }
-        slog(`Bing: ${results.length} results`);
-        status = "Bing OK";
-        if (results.length > 0) {
-            searchEngineStatus = status;
-            lastSearchError = "";
-            return results;
-        }
-    }
-    catch (err) {
-        slog(`Bing err: ${String(err)}`);
-    }
-    // Engine 3: DDG JSON (instant answers only — for facts, not news)
-    try {
-        const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-        slog(`DDG JSON...`);
-        const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
-        const data = await resp.json();
-        anyEngineReachable = true;
-        const results = [];
-        const abs = data.AbstractText?.trim();
-        if (abs)
-            results.push({ title: data.Heading || query, snippet: abs, url: data.AbstractURL || "" });
-        // Only include RelatedTopics if they contain real content (not just links)
-        const related = data.RelatedTopics;
-        if (related)
-            for (const r of related) {
-                if (r.Text && results.length < 6) {
-                    const clean = r.Text.replace(/<[^>]+>/g, "").trim();
-                    // Skip entries that are just link descriptions (no real content)
-                    if (clean.length > 30)
-                        results.push({ title: "", snippet: clean, url: r.FirstURL || "" });
-                }
-            }
-        slog(`DDG JSON: ${resp.status}, abstract=${abs ? "yes" : "no"}, useful=${results.length}`);
-        status = "DDG JSON OK";
-        if (results.length > 0) {
-            searchEngineStatus = status;
-            lastSearchError = "";
-            return results;
-        }
-    }
-    catch (err) {
-        slog(`DDG JSON err: ${String(err)}`);
-    }
-    searchEngineStatus = anyEngineReachable ? `${status} (空结果)` : "ALL DEAD";
-    lastSearchError = anyEngineReachable ? "" : "全部搜索引擎无法连接";
-    if (!anyEngineReachable)
-        slog(`ALL engines unreachable`);
-    return [];
-}
-/** Startup self-test: try a simple search and report */
-async function testSearch() {
-    log(`🧪 搜索引擎自检...`);
-    const results = await performSearch("hello world");
-    if (results.length > 0) {
-        log(`✅ 搜索正常 (${results.length} 条)`);
-        return `✅ 搜索正常 — ${searchEngineStatus}`;
-    }
-    log(`❌ 搜索失败: ${lastSearchError}`);
-    return `❌ 搜索失败 — ${lastSearchError}`;
-}
-function formatSearchResults(query, results) {
-    if (results.length === 0)
-        return `未找到与 "${query}" 相关的结果。`;
-    return results.map((r, i) => {
-        const title = r.title ? `**${r.title}**\n` : "";
-        return `[${i + 1}] ${title}${r.snippet}\n   ${r.url ? `🔗 ${r.url}` : ""}`;
-    }).join("\n\n");
-}
-// ---------------------------------------------------------------------------
-// Full-text page fetching (for deep summarization)
-// ---------------------------------------------------------------------------
-/** Extract visible text from HTML, removing scripts/styles/tags */
-function htmlToText(html) {
-    let text = html
-        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, "")
-        .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, "")
-        .replace(/<[^>]+>/g, "\n")
-        .replace(/&nbsp;/g, " ")
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&#x27;/g, "'")
-        .replace(/&quot;/g, '"')
-        .replace(/\n{3,}/g, "\n\n")
-        .replace(/[ \t]+/g, " ")
-        .split("\n")
-        .map(l => l.trim())
-        .filter(l => l.length > 20) // skip navigation/empty lines
-        .join("\n");
-    // Truncate to reasonable size
-    if (text.length > 4000)
-        text = text.slice(0, 4000) + "...";
-    return text;
-}
-async function fetchPageText(url) {
-    try {
-        const resp = await fetch(url, {
-            signal: AbortSignal.timeout(8000),
-            headers: { "User-Agent": "Mozilla/5.0 (compatible; ClaudeWeixinBot/1.0)", "Accept": "text/html", "Accept-Language": "zh-CN,en" },
-        });
-        const html = await resp.text();
-        return htmlToText(html);
-    }
-    catch {
-        return "";
-    }
-}
-/**
- * Fetch full text of top N search results for deep summarization.
- * Returns concatenated page contents with source attribution.
- */
-/** Filter out junk domains that don't contain useful article text */
-const JUNK_DOMAINS = [
-    "amazon.", "ebay.", "etsy.", "walmart.", "bestbuy.", "target.",
-    "youtube.", "vimeo.", "reddit.", "twitter.", "facebook.", "instagram.",
-    "wikipedia.org", "britannica.com", "dictionary.com",
-    "pinterest.", "tripadvisor.", "booking.com"
-];
-function isNewsWorthy(url) {
-    const lower = url.toLowerCase();
-    return !JUNK_DOMAINS.some(d => lower.includes(d));
-}
-async function fetchTopPages(results, maxPages = 3) {
-    const urls = results
-        .filter(r => r.url && !r.url.includes("duckduckgo.com") && isNewsWorthy(r.url))
-        .slice(0, maxPages);
-    if (urls.length === 0)
-        return "";
-    log(`📄 抓取 ${urls.length} 个页面全文...`);
-    const pages = [];
-    for (const r of urls) {
-        const text = await fetchPageText(r.url);
-        if (text) {
-            pages.push(`--- 来源: ${r.title || r.url} ---\n${r.url}\n\n${text}`);
-            log(`   ✅ ${r.title?.slice(0, 40) || r.url.slice(0, 40)} (${text.length} 字)`);
-        }
-        else {
-            log(`   ⚠️  ${r.title?.slice(0, 40) || r.url.slice(0, 40)} 抓取失败`);
-        }
-    }
-    return pages.length > 0 ? pages.join("\n\n") : "";
-}
 // ---------------------------------------------------------------------------
 // Agent Tools
 // ---------------------------------------------------------------------------
@@ -1233,15 +801,6 @@ function calculateExpression(expr) {
     catch (e) {
         return `计算失败: ${String(e)}`;
     }
-}
-/** Simple translation via pre-search */
-async function quickTranslate(text, targetLang) {
-    const q = `translate "${text}" to ${targetLang}`;
-    const results = await performSearch(q);
-    if (results.length > 0) {
-        return results.slice(0, 2).map(r => `${r.title}\n${r.snippet}`).join("\n\n");
-    }
-    return `无法翻译 "${text.slice(0, 50)}"`;
 }
 /** Run code snippet (JavaScript only, timeout 3s, no network/fs) */
 async function runCodeSnippet(code) {
@@ -1286,21 +845,6 @@ const AGENT_TOOLS = [
     {
         type: "function",
         function: {
-            name: "translate",
-            description: "翻译文本到指定语言。当用户要求翻译时使用。",
-            parameters: {
-                type: "object",
-                properties: {
-                    text: { type: "string", description: "要翻译的文本" },
-                    target: { type: "string", description: "目标语言，如 English、中文、日语、法语" },
-                },
-                required: ["text", "target"],
-            },
-        },
-    },
-    {
-        type: "function",
-        function: {
             name: "run_code",
             description: "执行 JavaScript 代码。用于数学计算、数据处理、算法演示。不能访问文件系统和网络。输出使用 console.log()。",
             parameters: {
@@ -1310,6 +854,8 @@ const AGENT_TOOLS = [
             },
         },
     },
+    // Kimi 内置联网搜索：客户端不执行搜索，收到 tool_call 后把 arguments 原样回传，由 Kimi 服务端完成搜索
+    { type: "builtin_function", function: { name: "$web_search" } },
 ];
 async function executeToolCalls(toolCalls) {
     const results = [];
@@ -1318,18 +864,20 @@ async function executeToolCalls(toolCalls) {
         const fn = tc.function;
         const name = fn?.name || "";
         const argsStr = fn?.arguments || "{}";
-        const args = JSON.parse(argsStr);
         let output = "";
         try {
-            if (name === "calculate") {
+            if (name === "$web_search") {
+                // Kimi 内置联网搜索：客户端不执行，原样回传 arguments，由 Kimi 服务端完成搜索
+                output = argsStr;
+                log("🔍 Kimi 联网搜索");
+            }
+            else if (name === "calculate") {
+                const args = JSON.parse(argsStr);
                 output = calculateExpression(args.expression || "");
                 log(`🧮 计算: ${args.expression} → ${output.slice(0, 60)}`);
             }
-            else if (name === "translate") {
-                output = await quickTranslate(args.text || "", args.target || "English");
-                log(`🌐 翻译: ${(args.text || "").slice(0, 30)} → ${args.target}`);
-            }
             else if (name === "run_code") {
+                const args = JSON.parse(argsStr);
                 output = await runCodeSnippet(args.code || "");
                 log(`💻 代码: ${(args.code || "").slice(0, 50)}`);
             }
@@ -1345,7 +893,7 @@ async function executeToolCalls(toolCalls) {
     return results;
 }
 // ---------------------------------------------------------------------------
-// LLM call — with Agent Tool Loop + Pre-Search
+// LLM call — with Agent Tool Loop
 // ---------------------------------------------------------------------------
 async function callLLM(userId, userMessage, account) {
     const client = new OpenAI({
@@ -1363,74 +911,45 @@ async function callLLM(userId, userMessage, account) {
     if (config.typing_ticket) {
         sendTyping({ baseUrl: account.baseUrl, token: account.botToken, ilinkUserId: userId, typingTicket: config.typing_ticket, status: 1 }).catch(() => { });
     }
-    // --- Decide whether to search first ---
-    let searchContext = "";
-    let searchHint = "";
-    const searchQuery = shouldSearch(userMessage);
-    if (searchQuery) {
-        log(`🔍 搜索触发: "${searchQuery}"`);
-        const optimized = optimizeSearchQuery(searchQuery);
-        log(`🔍 优化后: "${optimized}"`);
-        const results = await performSearch(optimized);
-        log(`🔍 搜索结果: ${results.length} 条`);
-        if (results.length > 0) {
-            searchContext = `（${new Date().toLocaleDateString("zh-CN")}）：\n${formatSearchResults(searchQuery, results)}`;
-            searchHint = "📡 ";
-            // Fetch full pages only if snippets are thin (not from Google News RSS)
-            const hasRichSnippets = results.some(r => r.snippet && r.snippet.length > 100);
-            if (!hasRichSnippets) {
-                const fullPages = await fetchTopPages(results, 2);
-                if (fullPages)
-                    searchContext += `\n\n--- 详细内容 ---\n${fullPages}`;
-            }
-        }
-        else {
-            searchHint = "";
-            log(`⚠️ 所有搜索引擎均失败`);
-        }
-    }
     // --- Build prompt ---
-    // Strategy: Don't say "search" or "web" or "资料". Just splice results into the user message
-    // as if the user copy-pasted them. DeepSeek can't refuse to read user-provided text.
     // Load persistent memories for this user
     const memories = loadMemories(userId);
     const memoryPrompt = memoryToPrompt(memories);
-    let systemMsg = SYSTEM_PROMPT + memoryPrompt;
-    let promptUserMessage = userMessage;
-    if (searchContext) {
-        // Rewrite the entire user message: results ARE the user message now
-        const cleanResults = searchContext
-            .replace(/搜索/g, "")
-            .replace(/互联网/g, "")
-            .replace(/联网/g, "")
-            .replace(/抓取/g, "");
-        promptUserMessage = `我整理了一些相关内容，帮我看看并回答：
-
-${cleanResults}
-
---- 请帮我总结以上内容的要点，用中文回答 ---`;
-    }
+    const systemMsg = SYSTEM_PROMPT + memoryPrompt;
     const messages = [
         { role: "system", content: systemMsg },
         ...convo.map(m => ({ role: m.role, content: m.content })),
-        { role: "user", content: promptUserMessage },
+        { role: "user", content: userMessage },
     ];
     let replyText = "";
     try {
-        // --- Agent Tool Loop (max 3 rounds) ---
+        // --- Agent Tool Loop (max 6 rounds, 联网搜索可能多轮) ---
         let workingMessages = [...messages];
-        const MAX_TOOL_ROUNDS = 3;
+        const MAX_TOOL_ROUNDS = 6;
+        let model = CLAUDE_MODEL;
+        let fellBack = false;
         for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
             // Non-streaming call to check for tool requests
-            const resp = await client.chat.completions.create({
-                model: CLAUDE_MODEL,
-                messages: workingMessages,
-                max_tokens: LLM_MAX_TOKENS,
-                temperature: LLM_TEMPERATURE,
-                top_p: 0.95,
-                tools: AGENT_TOOLS,
-                ...(CLAUDE_MODEL.includes("v4-pro") ? { reasoning_effort: LLM_REASONING } : {}),
-            });
+            let resp;
+            try {
+                resp = await client.chat.completions.create({
+                    model,
+                    messages: workingMessages,
+                    max_tokens: LLM_MAX_TOKENS,
+                    tools: AGENT_TOOLS,
+                    ...(model.startsWith("kimi-k3") ? { reasoning_effort: LLM_REASONING } : {}),
+                });
+            }
+            catch (err) {
+                // k3 的 $web_search 续传 400 → 降级到 k2.6 重试整个工具循环
+                if (!fellBack && model !== SEARCH_MODEL && /400|tokenization/i.test(String(err))) {
+                    log(`⚠️ ${model} 工具调用被拒，降级到 ${SEARCH_MODEL} 重试`);
+                    model = SEARCH_MODEL;
+                    fellBack = true;
+                    continue;
+                }
+                throw err;
+            }
             const choice = resp.choices?.[0];
             const toolCalls = choice?.message?.tool_calls;
             if (toolCalls && toolCalls.length > 0) {
@@ -1448,13 +967,11 @@ ${cleanResults}
         // If reply is empty after tool loop, do a final streaming call
         if (!replyText.trim()) {
             const stream = await client.chat.completions.create({
-                model: CLAUDE_MODEL,
+                model,
                 messages: workingMessages,
                 max_tokens: LLM_MAX_TOKENS,
-                temperature: LLM_TEMPERATURE,
-                top_p: 0.95,
                 stream: true,
-                ...(CLAUDE_MODEL.includes("v4-pro") ? { reasoning_effort: LLM_REASONING } : {}),
+                ...(model.startsWith("kimi-k3") ? { reasoning_effort: LLM_REASONING } : {}),
             });
             for await (const chunk of stream) {
                 const delta = chunk.choices?.[0]?.delta?.content;
@@ -1466,18 +983,13 @@ ${cleanResults}
         if (config.typing_ticket) {
             sendTyping({ baseUrl: account.baseUrl, token: account.botToken, ilinkUserId: userId, typingTicket: config.typing_ticket, status: 2 }).catch(() => { });
         }
-        // Store conversation (original message, not the search-augmented one)
+        // Store conversation
         convo.push({ role: "user", content: userMessage });
         convo.push({ role: "assistant", content: replyText });
         trimConversation(convo);
         // Background: extract user facts from this exchange (non-blocking)
         extractFactsInBackground(userId, userMessage, replyText);
-        // Prepend search indicator if search was triggered
-        const result = splitText(replyText);
-        if (searchHint && result.length > 0) {
-            result[0] = searchHint + " " + result[0];
-        }
-        return result;
+        return splitText(replyText);
     }
     catch (err) {
         if (config.typing_ticket) {
@@ -1520,6 +1032,7 @@ function splitText(text) {
 // Daily Push (weather + news, scheduled)
 // ---------------------------------------------------------------------------
 const DAILY_PUSH_TIME = process.env.DAILY_PUSH_TIME || ""; // "08:00" format
+const PUSH_CITY = process.env.PUSH_CITY || "北京"; // 每日推送查询天气的城市
 let pushTimer = null;
 async function runDailyPush(account) {
     const userId = account.userId;
@@ -1529,50 +1042,58 @@ async function runDailyPush(account) {
     }
     log(`⏰ 执行每日推送...`);
     const dateStr = new Date().toLocaleDateString("zh-CN", { weekday: "long", month: "long", day: "numeric" });
-    // 1. Search weather
-    let weatherText = "";
     try {
-        const weatherResults = await performSearch(`weather forecast today`);
-        if (weatherResults.length > 0) {
-            weatherText = weatherResults.slice(0, 3).map(r => `${r.title}${r.snippet ? `: ${r.snippet}` : ""}`).join("\n");
+        const client = new OpenAI({ apiKey: process.env.LLM_API_KEY, baseURL: LLM_BASE_URL });
+        const workingMessages = [
+            { role: "user", content: `今天是${dateStr}。请联网查询${PUSH_CITY}今日天气和今日科技新闻，生成一份简短的中文早间简报：天气概况 + 5 条以内新闻要点（每条一行），语气轻快，适合微信阅读。` },
+        ];
+        // 工具循环（最多 4 轮）：$web_search 由 Kimi 服务端执行，arguments 原样回传
+        // 推送必走搜索，直接用 k2.6（k3 的 $web_search 续传有服务端 bug）
+        let replyText = "";
+        for (let round = 0; round < 4; round++) {
+            const resp = await client.chat.completions.create({
+                model: SEARCH_MODEL,
+                messages: workingMessages,
+                max_tokens: 4096,
+                tools: [
+                    { type: "builtin_function", function: { name: "$web_search" } },
+                ],
+            });
+            const choice = resp.choices?.[0];
+            const toolCalls = choice?.message?.tool_calls;
+            if (toolCalls && toolCalls.length > 0) {
+                // Execute tools and continue loop
+                workingMessages.push(choice.message);
+                const toolResults = await executeToolCalls(toolCalls);
+                workingMessages.push(...toolResults);
+                continue;
+            }
+            replyText = choice?.message?.content || "";
+            break;
         }
-    }
-    catch {
-        weatherText = "天气数据暂不可用";
-    }
-    // 2. Search news
-    let newsText = "";
-    try {
-        const newsResults = await performSearch(`latest technology news ${new Date().toISOString().slice(0, 10)}`);
-        if (newsResults.length > 0) {
-            newsText = newsResults.slice(0, 5).map(r => `• ${r.title}${r.snippet ? ` — ${r.snippet.slice(0, 100)}` : ""}`).join("\n");
-        }
-    }
-    catch {
-        newsText = "新闻数据暂不可用";
-    }
-    // 3. Compose and send
-    const summary = `☀️ ${dateStr} 早间简报
-
-🌤️ 天气
-${weatherText || "暂无天气数据"}
-
-📰 科技早报
-${newsText || "暂无新闻数据"}
-
-✨ 祝你今天愉快！`;
-    try {
+        if (!replyText.trim())
+            throw new Error("模型返回为空");
         await sendMessage({
             baseUrl: account.baseUrl,
             token: account.botToken,
             toUserId: userId,
-            text: summary,
+            text: `☀️ ${dateStr} 早间简报\n\n${replyText}`,
             contextToken: getContextToken(userId),
         });
         log(`✅ 每日推送完成 → ${userId}`);
     }
     catch (err) {
         log(`❌ 每日推送失败: ${String(err)}`);
+        try {
+            await sendMessage({
+                baseUrl: account.baseUrl,
+                token: account.botToken,
+                toUserId: userId,
+                text: `☀️ ${dateStr} 早间简报生成失败，请稍后再试。`,
+                contextToken: getContextToken(userId),
+            });
+        }
+        catch { /* 发送失败只能放弃 */ }
     }
 }
 function scheduleDailyPush(account) {
@@ -1685,35 +1206,23 @@ async function runMonitor(account) {
                 log(`📩 收到消息 from=${fromUser}: ${text.slice(0, 100)}${text.length > 100 ? "..." : ""}`);
                 if (mediaType)
                     log(`   📎 附件类型: ${mediaType}`);
+                if (mediaType === "file" || mediaType === "video")
+                    log(`   📦 附件原始数据: ${JSON.stringify(msg.item_list).slice(0, 500)}`);
                 // --- Slash commands ---
                 if (text === "/diag" || text === "/debug") {
                     const diag = `🤖 Claude-Weixin-Bot v1.1.0
-📡 模型: ${CLAUDE_MODEL}
-🧠 推理: ${LLM_REASONING} | 温度: ${LLM_TEMPERATURE} | tokens: ${LLM_MAX_TOKENS}
+📡 主模型: ${CLAUDE_MODEL}
+🧠 推理: ${LLM_REASONING} | tokens: ${LLM_MAX_TOKENS}
 🔗 API: ${LLM_BASE_URL}
-🖼️  图片: ${NL_API_KEY ? "✅ nonelinear Gemini" : "❌ 未配置"}
-🔍 搜索: ${searchEngineStatus}
+🖼️  视觉模型: ${VISION_MODEL}
+🔍 搜索: Kimi 内置联网
 🧠 记忆: ${loadMemories(fromUser).length} 条
 ⏰ 推送: ${DAILY_PUSH_TIME || "关闭"}
-🛠️ Agent: 计算/翻译/代码
-⚠️ 错误: ${lastSearchError || "无"}
+🛠️ Agent: 计算/代码/联网搜索
 💾 状态: ${isSessionPaused() ? "暂停中" : "运行中"}
 🗣️  上下文: ${getConversation(fromUser).length} 条`;
                     await sendMessage({ baseUrl: account.baseUrl, token: account.botToken, toUserId: fromUser, text: diag, contextToken: getContextToken(fromUser) });
                     log(`📤 诊断回复 to=${fromUser}`);
-                    continue;
-                }
-                if (text === "/testsearch" || text.startsWith("/s ")) {
-                    const sq = text === "/testsearch" ? "hello world" : text.slice(3).trim();
-                    log(`🧪 手动搜索测试: "${sq}"`);
-                    const results = await performSearch(sq);
-                    if (results.length > 0) {
-                        const formatted = formatSearchResults(sq, results);
-                        await sendMessage({ baseUrl: account.baseUrl, token: account.botToken, toUserId: fromUser, text: `【搜索正常】${searchEngineStatus}\n\n${formatted}`, contextToken: getContextToken(fromUser) });
-                    }
-                    else {
-                        await sendMessage({ baseUrl: account.baseUrl, token: account.botToken, toUserId: fromUser, text: `【搜索失败】${searchEngineStatus} — ${lastSearchError}`, contextToken: getContextToken(fromUser) });
-                    }
                     continue;
                 }
                 // --- Handle media types ---
@@ -1815,12 +1324,12 @@ async function main() {
     if (!process.env.LLM_API_KEY) {
         log("❌ 请在 .env 中设置 LLM_API_KEY");
         log("   LLM_API_KEY=sk-...");
-        log("   LLM_BASE_URL=https://api.deepseek.com/v1");
-        log("   LLM_MODEL=deepseek-chat");
+        log("   LLM_BASE_URL=https://api.moonshot.cn/v1");
+        log("   LLM_MODEL=kimi-k3");
         process.exit(1);
     }
     log(`🤖 模型: ${CLAUDE_MODEL}`);
-    log(`🧠 推理深度: ${LLM_REASONING} | 温度: ${LLM_TEMPERATURE} | max_tokens: ${LLM_MAX_TOKENS}`);
+    log(`🧠 推理深度: ${LLM_REASONING} | max_tokens: ${LLM_MAX_TOKENS}`);
     log(`🔗 API: ${LLM_BASE_URL}`);
     log(`💾 状态目录: ${STATE_DIR}`);
     // Load or create account
@@ -1845,14 +1354,9 @@ async function main() {
         }
     }
     log("");
-    // Startup self-diagnostic
-    const searchDiag = await testSearch();
-    log(searchDiag);
-    log("");
     log("━━━━━━━━━━━━━━━━━━━━━━━━━");
     log("📡 开始监听微信消息...");
     log("   /diag — 查看诊断信息");
-    log("   /testsearch — 测试搜索");
     log("   按 Ctrl+C 停止");
     log("");
     // Start daily push scheduler
